@@ -1,0 +1,17 @@
+path: D:/Projek/Kodingan/exercise.v4-up-exercise.yolov8
+train: train/images
+val: valid/images
+test: test/images
+
+kpt_shape: [13, 3]
+flip_idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+nc: 6
+names: ['Bird Dog', 'Knee Push up', 'Plank', 'Push up', 'Revese Lunge', 'Squat']
+
+roboflow:
+  workspace: jaew4
+  project: exercise-7efha
+  version: 4
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/jaew4/exercise-7efha/dataset/4
