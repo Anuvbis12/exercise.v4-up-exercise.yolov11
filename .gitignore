@@ -1,10 +1,8 @@
 # Ignore large model weights and datasets
-*.pt
 *.onnx
 *.engine
 *.zip
-runs/
-models/
 __pycache__/
 .ipynb_checkpoints/
 *.docx
+
