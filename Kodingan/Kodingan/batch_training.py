@@ -18,7 +18,7 @@ def train_yolo_batch():
     data_yaml = os.path.join(base_dir, "exercise.v4-up-exercise.yolov8", "data.yaml")
     epochs = 50 # Diatur ke 50 epoch
     imgsz = 640
-    device = 0 # 0 untuk GPU RTX 5050 (NVIDIA Blackwell cu128)
+    device = 0 # 0
     optimizer = "AdamW"
     batch_size = 8 # Disesuaikan ke 8 untuk stabilitas VRAM model XL (8GB VRAM)
     workers = 0 # 0 agar tidak memakan RAM sistem untuk subprocess
