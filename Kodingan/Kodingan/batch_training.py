@@ -16,7 +16,7 @@ def train_yolo_batch():
     # Path ke file data.yaml pada dataset Roboflow
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_yaml = os.path.join(base_dir, "exercise.v4-up-exercise.yolov8", "data.yaml")
-    epochs = 50 # Diatur ke 50 epoch
+    epochs = 50 # Tetap 50 epoch sesuai keinginan
     imgsz = 640
     device = 0 # 0
     optimizer = "AdamW"
@@ -25,19 +25,24 @@ def train_yolo_batch():
     amp = True # Automatic Mixed Precision (FP16) di GPU
     cache = False # Tanpa RAM cache
     
-    # Hiperparameter Optimasi Pose & Loss
-    lr0 = 0.002 # Learning rate awal yang disarankan untuk AdamW
+    # Hiperparameter Regularisasi & Optimasi Pose (Target mAP 90-93% Robust)
+    lr0 = 0.0015 # LR awal disesuaikan untuk regularisasi AdamW
     lrf = 0.01 # Learning rate akhir ratio
-    cos_lr = True # Cosine learning rate decay (penurunan LR lebih mulus)
+    cos_lr = True # Cosine learning rate decay
     patience = 30 # Early stopping jika metric plateau selama 30 epoch
-    close_mosaic = 15 # Nonaktifkan mosaic 15 epoch terakhir agar model fokus pada objek asli
-    pose_loss_weight = 12.0 # Bobot Loss Keypoint Pose
+    weight_decay = 0.002 # Regularisasi L2 lebih tinggi untuk menekan over-fitting model XL
+    dropout = 0.15 # Dropout 15% pada head model untuk mencegah hafalan piksel
+    pose_loss_weight = 8.0 # Turunkan bobot loss pose dari 12.0 ke 8.0 agar tidak over-fit
+    close_mosaic = 5 # Nonaktifkan mosaic 5 epoch terakhir saja
     
-    # Augmentasi Data khusus Pose Biomekanika
-    degrees = 10.0 # Rotasi sudut 10 derajat
-    translate = 0.1 # Pergeseran translasi 10%
+    # Augmentasi Data Diperketat (Generalisasi Realistis)
+    degrees = 25.0 # Rotasi sudut 25 derajat (lebih ekstrem)
+    translate = 0.15 # Pergeseran translasi 15%
     scale = 0.5 # Skala zoom 50%
-    fliplr = 0.5 # Flip horizontal (keypoints disesuaikan otomatis)
+    shear = 5.0 # Distorsi geser 5 derajat
+    fliplr = 0.5 # Flip horizontal
+    mixup = 0.15 # Mixup 15% untuk pencampuran antar gambar
+    erasing = 0.4 # Random erasing 40% untuk penutupan anggota tubuh acak
 
     output_base_dir = "models/trained_weights"
     os.makedirs(output_base_dir, exist_ok=True)
@@ -71,12 +76,17 @@ def train_yolo_batch():
             lrf=lrf,
             cos_lr=cos_lr,
             patience=patience,
+            weight_decay=weight_decay,
+            dropout=dropout,
             close_mosaic=close_mosaic,
             pose=pose_loss_weight,
             degrees=degrees,
             translate=translate,
             scale=scale,
+            shear=shear,
             fliplr=fliplr,
+            mixup=mixup,
+            erasing=erasing,
             project=output_base_dir,
             name=model_name.split('.')[0]
         )
