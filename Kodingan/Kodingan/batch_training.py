@@ -9,18 +9,18 @@ def train_yolo_batch():
         #'yolo11n-pose.pt', 
         #'yolo11s-pose.pt', 
         #'yolo11m-pose.pt', 
-        'yolo11l-pose.pt', 
-        #'yolo11x-pose.pt'
+        #'yolo11l-pose.pt', 
+        'yolo11x-pose.pt'
     ]
     
     # Path ke file data.yaml pada dataset Roboflow
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_yaml = os.path.join(base_dir, "exercise.v4-up-exercise.yolov8", "data.yaml")
-    epochs = 40 # Ditingkatkan dari 50 ke 150 (mAP50-95 sedang naik tajam di epoch 40-50)
+    epochs = 50 # Diatur ke 50 epoch
     imgsz = 640
-    device = 0 # 0 untuk GPU pertama (NVIDIA RTX 3050)
+    device = 0 # 0 untuk GPU RTX 5050 (NVIDIA Blackwell cu128)
     optimizer = "AdamW"
-    batch_size = 16 # Ukuran batch yang pas untuk 6GB VRAM
+    batch_size = 8 # Disesuaikan ke 8 untuk stabilitas VRAM model XL (8GB VRAM)
     workers = 0 # 0 agar tidak memakan RAM sistem untuk subprocess
     amp = True # Automatic Mixed Precision (FP16) di GPU
     cache = False # Tanpa RAM cache
