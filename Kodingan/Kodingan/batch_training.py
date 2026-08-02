@@ -26,13 +26,14 @@ def train_yolo_batch():
     cache = False # Tanpa RAM cache
     
     # Hiperparameter Regularisasi & Optimasi Pose (Target mAP 90-93% Robust)
-    lr0 = 0.0015 # LR awal disesuaikan untuk regularisasi AdamW
+    lr0 = 0.0010 # LR awal diperhalus untuk stabilitas warmup
     lrf = 0.01 # Learning rate akhir ratio
+    warmup_epochs = 6.0 # Perpanjang warmup agar kurva loss di awal mulus
     cos_lr = True # Cosine learning rate decay
     patience = 30 # Early stopping jika metric plateau selama 30 epoch
     weight_decay = 0.002 # Regularisasi L2 lebih tinggi untuk menekan over-fitting model XL
     dropout = 0.15 # Dropout 15% pada head model untuk mencegah hafalan piksel
-    pose_loss_weight = 8.0 # Turunkan bobot loss pose dari 12.0 ke 8.0 agar tidak over-fit
+    pose_loss_weight = 10.0 # Bobot loss pose dinaikkan ke 10.0 untuk presisi kobj/keypoint tinggi
     close_mosaic = 5 # Nonaktifkan mosaic 5 epoch terakhir saja
     
     # Augmentasi Data Diperketat (Generalisasi Realistis)
@@ -42,7 +43,7 @@ def train_yolo_batch():
     shear = 5.0 # Distorsi geser 5 derajat
     fliplr = 0.5 # Flip horizontal
     mixup = 0.15 # Mixup 15% untuk pencampuran antar gambar
-    erasing = 0.4 # Random erasing 40% untuk penutupan anggota tubuh acak
+    erasing = 0.2 # Random erasing 20% agar keypoint tidak terlalu sering hilang acak
 
     output_base_dir = "models/trained_weights"
     os.makedirs(output_base_dir, exist_ok=True)
@@ -74,6 +75,7 @@ def train_yolo_batch():
             optimizer=optimizer,
             lr0=lr0,
             lrf=lrf,
+            warmup_epochs=warmup_epochs,
             cos_lr=cos_lr,
             patience=patience,
             weight_decay=weight_decay,
