@@ -8,3 +8,10 @@ __pycache__/
 .ipynb_checkpoints/
 *.docx
 
+# YOLO Dataset caches
+*.cache
+
+# YOLO Validation run folders
+runs/pose/val*
+
+
