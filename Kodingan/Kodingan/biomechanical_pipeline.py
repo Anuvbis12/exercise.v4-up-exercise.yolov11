@@ -10,13 +10,11 @@ from ultralytics import YOLO
 
 class ThreadedWebcam:
     """
-    Multithreaded Camera Reader untuk menghilangkan blocking lag cap.read() pada Windows.
-    Frame ditangkap di background thread secara asinkron (0 ms latency di main loop).
+    Multithreaded Camera Reader teroptimasi ultra-low latency (0 ms queue lag).
+    Membuang frame lama secara kontinu (buffer flushing) untuk HP camera stream.
     """
     def __init__(self, src=0):
-        self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
-        if not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(src)
+        self.cap = cv2.VideoCapture(src)
             
         if self.cap.isOpened():
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -38,25 +36,115 @@ class ThreadedWebcam:
     def update(self):
         while not self.stopped:
             if not self.cap.isOpened(): break
-            ret, frame = self.cap.read()
-            with self.lock:
-                self.grabbed = ret
-                self.frame = frame
-            time.sleep(0.005)
+            # Continuous grab to purge video buffer latency
+            self.cap.grab()
+            ret, frame = self.cap.retrieve()
+            if ret and frame is not None:
+                with self.lock:
+                    self.grabbed = ret
+                    self.frame = frame
+
+class WindowCaptureStream:
+    """
+    Menangkap stream video khusus jendela scrcpy (misal: 'POCO' atau 'scrcpy')
+    secara real-time tanpa menangkap seluruh layar (mencegah efek cermin tak hingga).
+    """
+    def __init__(self, window_title="POCO"):
+        self.window_title = str(window_title).lower()
+        self.bbox = None
+        self.stopped = False
+        self.lock = threading.Lock()
+        self.grabbed = False
+        self.frame = None
+        self._find_window()
+
+    def _find_window(self):
+        import ctypes
+        from ctypes import wintypes
+
+        target = self.window_title.strip().upper()
+        found_rect = None
+        found_name = None
+        user32 = ctypes.windll.user32
+
+        def enum_cb(hwnd, lparam):
+            nonlocal found_rect, found_name
+            if user32.IsWindowVisible(hwnd):
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buff = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buff, length + 1)
+                    title = buff.value.strip()
+                    t_upper = title.upper()
+                    
+                    # Cek Class Name (scrcpy menggunakan SDL_app)
+                    class_buff = ctypes.create_unicode_buffer(256)
+                    user32.GetClassNameW(hwnd, class_buff, 256)
+                    c_name = class_buff.value
+
+                    # Abaikan VS Code (Chrome_WidgetWin_1), Browser, CMD, dan OpenCV sendiri
+                    if c_name == "Chrome_WidgetWin_1" and "25053PC47G" not in title:
+                        return True
+                    if any(kw in t_upper for kw in ["BIOMECHANICAL", "PIPELINE", "COMMAND PROMPT", "POWERSHELL", "VISUAL STUDIO"]):
+                        return True
+
+                    # 100% Akurat: scrcpy window jika class_name == 'SDL_app' atau Judul Persis '25053PC47G'
+                    is_scrcpy_sdl = (c_name == "SDL_app")
+                    is_exact_title = (t_upper == "25053PC47G" or t_upper == target or "25053PC47G" in t_upper)
+
+                    if is_scrcpy_sdl or is_exact_title:
+                        r = wintypes.RECT()
+                        user32.GetWindowRect(hwnd, ctypes.byref(r))
+                        w, h = r.right - r.left, r.bottom - r.top
+                        if w > 100 and h > 100:
+                            # Crop area isi video scrcpy (titlebar 32px offset)
+                            found_rect = (r.left + 8, r.top + 32, r.right - 8, r.bottom - 8)
+                            found_name = f"'{title}' (Class: {c_name})"
+                            return False # Stop enum jika sudah ketemu scrcpy window
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
+
+        if found_rect:
+            if self.bbox != found_rect:
+                print(f"🎯 Jendela Kamera scrcpy Terdeteksi: {found_name} Area: {found_rect}")
+            self.bbox = found_rect
+        else:
+            self.bbox = None
+
+    def start(self):
+        t = threading.Thread(target=self.update, daemon=True)
+        t.start()
+        return self
+
+    def update(self):
+        from PIL import ImageGrab
+        while not self.stopped:
+            try:
+                self._find_window()
+                if self.bbox is not None:
+                    img = ImageGrab.grab(bbox=self.bbox)
+                    frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                    with self.lock:
+                        self.frame = frame
+                        self.grabbed = True
+                else:
+                    with self.lock:
+                        self.grabbed = False
+            except Exception:
+                pass
+            time.sleep(0.02)
 
     def read(self):
         with self.lock:
-            ret = self.grabbed
-            frame = self.frame.copy() if self.frame is not None else None
-        return ret, frame
+            return self.grabbed, (self.frame.copy() if self.frame is not None else None)
 
     def release(self):
         self.stopped = True
-        if self.cap.isOpened():
-            self.cap.release()
-            
+
     def isOpened(self):
-        return self.cap.isOpened()
+        return True
 
 class KeypointEMASmoother:
     """
@@ -202,19 +290,18 @@ class BiomechanicalPipeline:
             (11, 13), (13, 15), (12, 14), (14, 16)
         ]
 
-        # Gambar Garis Skeleton
+        # Gambar Garis Skeleton Tebal Warna Kuning Cerah (OpenPose Style Yellow Limbs)
         for p1, p2 in skeleton_limbs:
             if p1 < len(keypoints) and p2 < len(keypoints):
                 if confidences[p1] > self.conf_threshold and confidences[p2] > self.conf_threshold:
                     pt1 = (int(keypoints[p1][0]), int(keypoints[p1][1]))
                     pt2 = (int(keypoints[p2][0]), int(keypoints[p2][1]))
-                    cv2.line(frame, pt1, pt2, (0, 255, 0), 2)
+                    cv2.line(frame, pt1, pt2, (0, 230, 255), 4, cv2.LINE_AA)
 
-        # Gambar Titik Sendi (Keypoint Circles)
+        # Gambar Titik Sendi Merah Solid (OpenPose Style Red Joint Dots)
         for i, (x, y) in enumerate(keypoints):
             if confidences[i] > self.conf_threshold:
-                cv2.circle(frame, (int(x), int(y)), 5, (0, 0, 255), -1)
-                cv2.circle(frame, (int(x), int(y)), 2, (255, 255, 255), -1)
+                cv2.circle(frame, (int(x), int(y)), 7, (0, 0, 255), -1, cv2.LINE_AA)
 
         if movement == "Push-up":
             # Indeks: Bahu, Pinggul, Pergelangan Kaki (Ankle)
@@ -235,10 +322,15 @@ class BiomechanicalPipeline:
                     status = "POSTUR BURUK (Pinggul Terlalu Turun!)"
                     color = (0, 0, 255)
 
-        # Visualisasi Overlay Real-Time
-        cv2.putText(frame, f"Gerakan: {movement}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(frame, f"Status: {status}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-        cv2.putText(frame, f"FPS: {self.fps:.1f}", (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        # Header Visualisasi ala OpenPose
+        h, w = frame.shape[:2]
+        header_text = "YOLOv11 Pose Estimation"
+        cv2.putText(frame, header_text, (int(w * 0.15), 45), cv2.FONT_HERSHEY_DUPLEX, 1.1, (255, 50, 0), 3, cv2.LINE_AA)
+
+        # Visualisasi Overlay Info Real-Time
+        cv2.putText(frame, f"Gerakan: {movement}", (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, f"Status: {status}", (30, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+        cv2.putText(frame, f"FPS: {self.fps:.1f}", (30, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
         return frame
 
     def process_frame(self, frame):
@@ -291,22 +383,37 @@ if __name__ == "__main__":
     else:
         model_path = engine_path
     
-    # Sumber Video: Argumen arg1 jika ada (contoh: python biomechanical_pipeline.py video.mp4), jika tidak webcam 0
-    video_source = sys.argv[1] if len(sys.argv) > 1 else 0
-    if isinstance(video_source, str) and video_source.isdigit():
-        video_source = int(video_source)
-    
+    # Auto-detect Sumber Kamera HP / Webcam
+    video_source = None
+    if len(sys.argv) > 1:
+        video_source = sys.argv[1]
+        if isinstance(video_source, str) and video_source.isdigit():
+            video_source = int(video_source)
+    else:
+        # Cari kamera terhubung (indeks 0, 1, atau 2) tanpa DSHOW lock
+        for idx in [0, 1, 2]:
+            temp_cap = cv2.VideoCapture(idx)
+            if temp_cap.isOpened():
+                ret, frame = temp_cap.read()
+                temp_cap.release()
+                if ret and frame is not None:
+                    video_source = idx
+                    print(f"🔍 Auto-detected Kamera pada Indeks: {video_source}")
+                    break
+        if video_source is None:
+            video_source = 0
+
     if os.path.exists(model_path):
         pipeline = BiomechanicalPipeline(model_path)
         
-        # Buka video atau webcam dengan multithreading
+        # Buka webcam / window stream dengan multithreading
         if isinstance(video_source, int):
             webcam = ThreadedWebcam(video_source).start()
             if not webcam.isOpened():
                 print(f"❌ Gagal membuka sumber webcam: {video_source}")
                 sys.exit(1)
             
-            print(f"🎥 Memulai Real-Time Webcam Stream (Multithreaded 60 FPS)... Tekan 'q' untuk keluar.")
+            print(f"🎥 Memulai Stream Kamera Real-Time (Indeks {video_source}, Ultra-Low Latency)... Tekan 'q' untuk keluar.")
             while webcam.isOpened():
                 ret, frame = webcam.read()
                 if not ret or frame is None:
@@ -318,6 +425,20 @@ if __name__ == "__main__":
                 if cv2.waitKey(1) & 0xFF == ord('q'): break
                     
             webcam.release()
+            cv2.destroyAllWindows()
+        elif isinstance(video_source, str) and not os.path.exists(video_source):
+            # Jika video_source berupa nama jendela scrcpy (misal: 'POCO' atau 'scrcpy')
+            print(f"🖥️ Menangkap Jendela Kamera '{video_source}' secara Real-Time...")
+            win_stream = WindowCaptureStream(video_source).start()
+            while True:
+                ret, frame = win_stream.read()
+                if not ret or frame is None:
+                    time.sleep(0.01)
+                    continue
+                output = pipeline.process_frame(frame)
+                cv2.imshow("Biomechanical Analysis Pipeline", output)
+                if cv2.waitKey(1) & 0xFF == ord('q'): break
+            win_stream.release()
             cv2.destroyAllWindows()
         else:
             cap = cv2.VideoCapture(video_source)
