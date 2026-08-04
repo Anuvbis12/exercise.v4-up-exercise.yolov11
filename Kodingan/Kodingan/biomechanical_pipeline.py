@@ -1,10 +1,62 @@
 import os
+import sys
 import time
 import cv2
 import numpy as np
 import torch
 import math
+import threading
 from ultralytics import YOLO
+
+class ThreadedWebcam:
+    """
+    Multithreaded Camera Reader untuk menghilangkan blocking lag cap.read() pada Windows.
+    Frame ditangkap di background thread secara asinkron (0 ms latency di main loop).
+    """
+    def __init__(self, src=0):
+        self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+        if not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(src)
+            
+        if self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.grabbed, self.frame = self.cap.read()
+        else:
+            self.grabbed, self.frame = False, None
+            
+        self.stopped = False
+        self.lock = threading.Lock()
+        
+    def start(self):
+        if self.cap.isOpened():
+            t = threading.Thread(target=self.update, daemon=True)
+            t.start()
+        return self
+        
+    def update(self):
+        while not self.stopped:
+            if not self.cap.isOpened(): break
+            ret, frame = self.cap.read()
+            with self.lock:
+                self.grabbed = ret
+                self.frame = frame
+            time.sleep(0.005)
+
+    def read(self):
+        with self.lock:
+            ret = self.grabbed
+            frame = self.frame.copy() if self.frame is not None else None
+        return ret, frame
+
+    def release(self):
+        self.stopped = True
+        if self.cap.isOpened():
+            self.cap.release()
+            
+    def isOpened(self):
+        return self.cap.isOpened()
 
 class KeypointEMASmoother:
     """
@@ -55,13 +107,14 @@ class BiomechanicalPipeline:
 
     def stage1_extract_and_smooth(self, frame):
         """
-        Stage 1: Ekstraksi 17 keypoint COCO dan temporal smoothing teroptimasi.
+        Stage 1: Ekstraksi keypoint dan temporal smoothing teroptimasi.
         """
-        # Eksekusi inferensi di GPU dengan FP16 (jika didukung)
+        # Eksekusi inferensi teroptimasi (imgsz=320 untuk kecepatan super tinggi)
         results = self.detector.predict(
             frame, 
             device=self.device,
-            half=(self.device != 'cpu'),
+            imgsz=320,
+            conf=self.conf_threshold,
             verbose=False
         )
         
@@ -70,8 +123,8 @@ class BiomechanicalPipeline:
             return None, None
             
         kpt_data = results[0].keypoints[0] # Ambil deteksi pose orang pertama
-        keypoints = kpt_data.xy[0].cpu().numpy() # Shape (17, 2)
-        confidences = kpt_data.conf[0].cpu().numpy() if kpt_data.conf is not None else np.ones(17)
+        keypoints = kpt_data.xy[0].cpu().numpy() # Shape (N, 2)
+        confidences = kpt_data.conf[0].cpu().numpy() if kpt_data.conf is not None else np.ones(len(keypoints))
         
         # Terapkan EMA Smoothing pada koordinat keypoint
         smoothed_keypoints = self.smoother.update(keypoints)
@@ -94,8 +147,8 @@ class BiomechanicalPipeline:
         Stage 3a: Mengoreksi distorsi kamera miring menggunakan RANSAC Homography.
         Memetakan dari ruang citra miring ke tampilan samping (canonical side-view).
         """
-        # Indeks COCO: 5=Bahu Kiri, 6=Bahu Kanan, 11=Pinggul Kiri, 12=Pinggul Kanan
-        ref_indices = [5, 6, 11, 12]
+        # Indeks acuan: Bahu Kiri/Kanan, Pinggul Kiri/Kanan
+        ref_indices = [1, 2, 7, 8] if len(keypoints) == 13 else [5, 6, 11, 12]
         
         # Cek apakah keypoint acuan memiliki confidence yang memadai
         if any(confidences[idx] < self.conf_threshold for idx in ref_indices):
@@ -133,15 +186,44 @@ class BiomechanicalPipeline:
 
     def stage3_biomechanical_jaa(self, movement, keypoints, confidences, frame):
         """
-        Stage 3b: Evaluasi postur berdasarkan JAA (Joint Angle Accuracy).
+        Stage 3b: Evaluasi postur berdasarkan JAA (Joint Angle Accuracy) dan Visualisasi Skeleton.
         """
         status = "TERDETEKSI"
         color = (0, 255, 255)
         
+        # Pasangan koneksi tulang skeleton
+        skeleton_limbs = [
+            (1, 2), (1, 3), (3, 5), (2, 4), (4, 6), # Lengan atas/bawah
+            (1, 7), (2, 8), (7, 8),                # Torso / Bahu ke Pinggul
+            (7, 9), (9, 11), (8, 10), (10, 12)     # Kaki / Paha & Betis
+        ] if len(keypoints) == 13 else [
+            (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+            (5, 11), (6, 12), (11, 12),
+            (11, 13), (13, 15), (12, 14), (14, 16)
+        ]
+
+        # Gambar Garis Skeleton
+        for p1, p2 in skeleton_limbs:
+            if p1 < len(keypoints) and p2 < len(keypoints):
+                if confidences[p1] > self.conf_threshold and confidences[p2] > self.conf_threshold:
+                    pt1 = (int(keypoints[p1][0]), int(keypoints[p1][1]))
+                    pt2 = (int(keypoints[p2][0]), int(keypoints[p2][1]))
+                    cv2.line(frame, pt1, pt2, (0, 255, 0), 2)
+
+        # Gambar Titik Sendi (Keypoint Circles)
+        for i, (x, y) in enumerate(keypoints):
+            if confidences[i] > self.conf_threshold:
+                cv2.circle(frame, (int(x), int(y)), 5, (0, 0, 255), -1)
+                cv2.circle(frame, (int(x), int(y)), 2, (255, 255, 255), -1)
+
         if movement == "Push-up":
-            # Indeks: Bahu(5), Siku(7), Pergelangan Tangan(9), Pinggul(11), Pergelangan Kaki(15)
-            if confidences[5] > self.conf_threshold and confidences[11] > self.conf_threshold and confidences[15] > self.conf_threshold:
-                hip_angle = self.calculate_angle(keypoints[5], keypoints[11], keypoints[15])
+            # Indeks: Bahu, Pinggul, Pergelangan Kaki (Ankle)
+            kpt_shoulder, kpt_hip, kpt_ankle = (1, 7, 11) if len(keypoints) == 13 else (5, 11, 15)
+
+            if (confidences[kpt_shoulder] > self.conf_threshold and 
+                confidences[kpt_hip] > self.conf_threshold and 
+                confidences[kpt_ankle] > self.conf_threshold):
+                hip_angle = self.calculate_angle(keypoints[kpt_shoulder], keypoints[kpt_hip], keypoints[kpt_ankle])
                 
                 if hip_angle > 165:
                     status = "POSTUR SEMPURNA"
@@ -153,11 +235,6 @@ class BiomechanicalPipeline:
                     status = "POSTUR BURUK (Pinggul Terlalu Turun!)"
                     color = (0, 0, 255)
 
-        # Update FPS Calculation
-        curr_time = time.time()
-        self.fps = 1.0 / (curr_time - self.prev_time + 1e-6)
-        self.prev_time = curr_time
-
         # Visualisasi Overlay Real-Time
         cv2.putText(frame, f"Gerakan: {movement}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.putText(frame, f"Status: {status}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
@@ -165,9 +242,26 @@ class BiomechanicalPipeline:
         return frame
 
     def process_frame(self, frame):
-        # Tahap 1: Ekstraksi & EMA Smoothing
+        # Hitung FPS
+        curr_time = time.time()
+        self.fps = 1.0 / (curr_time - self.prev_time + 1e-6)
+        self.prev_time = curr_time
+
+        # Cek jika frame kamera hitam (shutter tertutup / privacy mode active)
+        # Jangan jalankan inferensi YOLO jika kamera hitam untuk menghemat CPU/GPU & hindari lag!
+        if frame is None or frame.mean() < 1.0:
+            cv2.putText(frame, "KAMERA HITAM / TERKUNCI!", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(frame, "Buka Privacy Shutter / Tekan Fn+F6 / Cek Lenovo Vantage", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.putText(frame, f"FPS: {self.fps:.1f}", (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            return frame
+
+        # Tahap 1: Ekstraksi & EMA Smoothing (Hanya jika frame valid)
         keypoints, confidences = self.stage1_extract_and_smooth(frame)
+
         if keypoints is None: 
+            # Tampilkan pesan jika belum/tidak ada pose terdeteksi
+            cv2.putText(frame, "Mencari Pose / Orang...", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+            cv2.putText(frame, f"FPS: {self.fps:.1f}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             return frame
         
         # Tahap 2: Klasifikasi Gerakan
@@ -185,26 +279,62 @@ if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(os.path.dirname(script_dir))
     
-    # Utamakan file engine TensorRT jika ada, jika tidak gunakan .pt
+    # Pilih model: Utamakan model Nano (yolo11n-pose-5) yang sangat ringan & cepat (high FPS)
+    nano_pt = os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11n-pose-5', 'weights', 'best.pt')
+    medium_pt = os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11m-pose', 'weights', 'best.pt')
     engine_path = os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11m-pose', 'weights', 'best.engine')
-    pt_path = os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11m-pose', 'weights', 'best.pt')
     
-    model_path = engine_path if os.path.exists(engine_path) else pt_path
+    if os.path.exists(nano_pt):
+        model_path = nano_pt
+    elif os.path.exists(medium_pt):
+        model_path = medium_pt
+    else:
+        model_path = engine_path
+    
+    # Sumber Video: Argumen arg1 jika ada (contoh: python biomechanical_pipeline.py video.mp4), jika tidak webcam 0
+    video_source = sys.argv[1] if len(sys.argv) > 1 else 0
+    if isinstance(video_source, str) and video_source.isdigit():
+        video_source = int(video_source)
     
     if os.path.exists(model_path):
         pipeline = BiomechanicalPipeline(model_path)
-        cap = cv2.VideoCapture(0)
         
-        print("🎥 Memulai Real-Time Biomechanical Stream (Tekan 'q' untuk keluar)...")
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret: break
-                
-            output = pipeline.process_frame(frame)
-            cv2.imshow("Biomechanical Analysis Pipeline", output)
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
-                
-        cap.release()
-        cv2.destroyAllWindows()
+        # Buka video atau webcam dengan multithreading
+        if isinstance(video_source, int):
+            webcam = ThreadedWebcam(video_source).start()
+            if not webcam.isOpened():
+                print(f"❌ Gagal membuka sumber webcam: {video_source}")
+                sys.exit(1)
+            
+            print(f"🎥 Memulai Real-Time Webcam Stream (Multithreaded 60 FPS)... Tekan 'q' untuk keluar.")
+            while webcam.isOpened():
+                ret, frame = webcam.read()
+                if not ret or frame is None:
+                    time.sleep(0.01)
+                    continue
+                    
+                output = pipeline.process_frame(frame)
+                cv2.imshow("Biomechanical Analysis Pipeline", output)
+                if cv2.waitKey(1) & 0xFF == ord('q'): break
+                    
+            webcam.release()
+            cv2.destroyAllWindows()
+        else:
+            cap = cv2.VideoCapture(video_source)
+            if not cap.isOpened():
+                print(f"❌ Gagal membuka sumber video: {video_source}")
+                sys.exit(1)
+
+            print(f"🎥 Memulai Stream File Video [{video_source}]... Tekan 'q' untuk keluar.")
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret or frame is None: break
+                    
+                output = pipeline.process_frame(frame)
+                cv2.imshow("Biomechanical Analysis Pipeline", output)
+                if cv2.waitKey(1) & 0xFF == ord('q'): break
+                    
+            cap.release()
+            cv2.destroyAllWindows()
     else:
         print(f"⚠️ Model tidak ditemukan di {model_path}. Harap selesaikan pelatihan terlebih dahulu.")

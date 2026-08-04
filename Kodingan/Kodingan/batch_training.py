@@ -14,15 +14,15 @@ def train_yolo_batch():
     models = [
         #'yolo11n-pose.pt', 
         #'yolo11s-pose.pt', 
-        #'yolo11m-pose.pt', 
-        'yolo11l-pose.pt', 
+        'yolo11m-pose.pt', 
+        #'yolo11l-pose.pt', 
         #'yolo11x-pose.pt'
     ]
     
     # Path ke file data.yaml pada dataset Roboflow
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_yaml = os.path.join(base_dir, "exercise.v4-up-exercise.yolov8", "data.yaml")
-    epochs = 200 
+    epochs = 100 
     imgsz = 640
     device = 0 
     optimizer = "AdamW"

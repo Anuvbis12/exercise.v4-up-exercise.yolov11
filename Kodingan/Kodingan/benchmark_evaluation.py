@@ -43,7 +43,7 @@ def run_benchmark(device=0):
     models = {
         'Nano': os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11n-pose-5', 'weights', 'best.pt'),
         'Small': os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11s-pose', 'weights', 'best.pt'),
-        'Medium': os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11m-pose', 'weights', 'best.pt'),
+        'Medium': os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11m-pose-3', 'weights', 'best.pt'),
         'Large': os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11l-pose-3', 'weights', 'best.pt'),
         'X-Large': os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11x-pose-6', 'weights', 'best.pt'),
         'TRT Engine (Medium)': os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11m-pose', 'weights', 'best.engine')
@@ -111,4 +111,4 @@ def run_benchmark(device=0):
     print(df_benchmark.to_markdown())
 
 if __name__ == "__main__":
-    run_benchmark(device=0)
+    run_benchmark(device=0)
