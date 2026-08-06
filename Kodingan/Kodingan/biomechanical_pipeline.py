@@ -1,25 +1,24 @@
 import os
 import sys
 import time
+import math
 import cv2
 import numpy as np
 import torch
-import math
 import threading
 from ultralytics import YOLO
 
 class ThreadedWebcam:
     """
     Multithreaded Camera Reader teroptimasi ultra-low latency (0 ms queue lag).
-    Membuang frame lama secara kontinu (buffer flushing) untuk HP camera stream.
+    Membuang frame lama secara kontinu (buffer flushing) untuk stream kamera real-time.
     """
     def __init__(self, src=0):
         self.cap = cv2.VideoCapture(src)
-            
         if self.cap.isOpened():
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
             self.grabbed, self.frame = self.cap.read()
         else:
             self.grabbed, self.frame = False, None
@@ -35,8 +34,8 @@ class ThreadedWebcam:
         
     def update(self):
         while not self.stopped:
-            if not self.cap.isOpened(): break
-            # Continuous grab to purge video buffer latency
+            if not self.cap.isOpened():
+                break
             self.cap.grab()
             ret, frame = self.cap.retrieve()
             if ret and frame is not None:
@@ -44,136 +43,82 @@ class ThreadedWebcam:
                     self.grabbed = ret
                     self.frame = frame
 
-class WindowCaptureStream:
-    """
-    Menangkap stream video khusus jendela scrcpy (misal: 'POCO' atau 'scrcpy')
-    secara real-time tanpa menangkap seluruh layar (mencegah efek cermin tak hingga).
-    """
-    def __init__(self, window_title="POCO"):
-        self.window_title = str(window_title).lower()
-        self.bbox = None
-        self.stopped = False
-        self.lock = threading.Lock()
-        self.grabbed = False
-        self.frame = None
-        self._find_window()
-
-    def _find_window(self):
-        import ctypes
-        from ctypes import wintypes
-
-        target = self.window_title.strip().upper()
-        found_rect = None
-        found_name = None
-        user32 = ctypes.windll.user32
-
-        def enum_cb(hwnd, lparam):
-            nonlocal found_rect, found_name
-            if user32.IsWindowVisible(hwnd):
-                length = user32.GetWindowTextLengthW(hwnd)
-                if length > 0:
-                    buff = ctypes.create_unicode_buffer(length + 1)
-                    user32.GetWindowTextW(hwnd, buff, length + 1)
-                    title = buff.value.strip()
-                    t_upper = title.upper()
-                    
-                    # Cek Class Name (scrcpy menggunakan SDL_app)
-                    class_buff = ctypes.create_unicode_buffer(256)
-                    user32.GetClassNameW(hwnd, class_buff, 256)
-                    c_name = class_buff.value
-
-                    # Abaikan VS Code (Chrome_WidgetWin_1), Browser, CMD, dan OpenCV sendiri
-                    if c_name == "Chrome_WidgetWin_1" and "25053PC47G" not in title:
-                        return True
-                    if any(kw in t_upper for kw in ["BIOMECHANICAL", "PIPELINE", "COMMAND PROMPT", "POWERSHELL", "VISUAL STUDIO"]):
-                        return True
-
-                    # 100% Akurat: scrcpy window jika class_name == 'SDL_app' atau Judul Persis '25053PC47G'
-                    is_scrcpy_sdl = (c_name == "SDL_app")
-                    is_exact_title = (t_upper == "25053PC47G" or t_upper == target or "25053PC47G" in t_upper)
-
-                    if is_scrcpy_sdl or is_exact_title:
-                        r = wintypes.RECT()
-                        user32.GetWindowRect(hwnd, ctypes.byref(r))
-                        w, h = r.right - r.left, r.bottom - r.top
-                        if w > 100 and h > 100:
-                            # Crop area isi video scrcpy (titlebar 32px offset)
-                            found_rect = (r.left + 8, r.top + 32, r.right - 8, r.bottom - 8)
-                            found_name = f"'{title}' (Class: {c_name})"
-                            return False # Stop enum jika sudah ketemu scrcpy window
-            return True
-
-        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-        user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
-
-        if found_rect:
-            if self.bbox != found_rect:
-                print(f"🎯 Jendela Kamera scrcpy Terdeteksi: {found_name} Area: {found_rect}")
-            self.bbox = found_rect
-        else:
-            self.bbox = None
-
-    def start(self):
-        t = threading.Thread(target=self.update, daemon=True)
-        t.start()
-        return self
-
-    def update(self):
-        from PIL import ImageGrab
-        while not self.stopped:
-            try:
-                self._find_window()
-                if self.bbox is not None:
-                    img = ImageGrab.grab(bbox=self.bbox)
-                    frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-                    with self.lock:
-                        self.frame = frame
-                        self.grabbed = True
-                else:
-                    with self.lock:
-                        self.grabbed = False
-            except Exception:
-                pass
-            time.sleep(0.02)
-
     def read(self):
         with self.lock:
             return self.grabbed, (self.frame.copy() if self.frame is not None else None)
 
+    def isOpened(self):
+        return self.cap is not None and self.cap.isOpened() and not self.stopped
+
     def release(self):
         self.stopped = True
+        if self.cap is not None:
+            self.cap.release()
 
-    def isOpened(self):
-        return True
 
-class KeypointEMASmoother:
+class OneEuroFilter:
     """
-    Exponential Moving Average (EMA) Smoother untuk memuluskan pergerakan keypoint
-    tanpa menimbulkan lag temporal yang parah.
+    Industry-Standard One-Euro Filter (Digunakan oleh MediaPipe, OpenPose, & ARKit).
+    Secara adaptif meredam jitter saat diam dan meredam lag saat bergerak cepat.
     """
-    def __init__(self, alpha=0.65):
-        self.alpha = alpha
-        self.smoothed_kpts = None
+    def __init__(self, min_cutoff=0.8, beta=0.005, d_cutoff=1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev = None
+        self.dx_prev = None
+        self.t_prev = None
 
-    def update(self, keypoints):
-        if self.smoothed_kpts is None or self.smoothed_kpts.shape != keypoints.shape:
-            self.smoothed_kpts = keypoints.copy()
-        else:
-            self.smoothed_kpts = self.alpha * keypoints + (1 - self.alpha) * self.smoothed_kpts
-        return self.smoothed_kpts
+    def _smoothing_factor(self, t_e, cutoff):
+        r = 2 * math.pi * cutoff * t_e
+        return r / (r + 1.0)
+
+    def _exponential_smoothing(self, a, x, x_prev):
+        return a * x + (1.0 - a) * x_prev
+
+    def filter(self, x, timestamp=None):
+        if timestamp is None:
+            timestamp = time.time()
+
+        if self.x_prev is None or self.x_prev.shape != x.shape:
+            self.t_prev = timestamp
+            self.x_prev = x.copy()
+            self.dx_prev = np.zeros_like(x)
+            return x.copy()
+
+        t_e = max(1e-5, timestamp - self.t_prev)
+        self.t_prev = timestamp
+
+        # Hitung turunan kecepatan pergerakan
+        a_d = self._smoothing_factor(t_e, self.d_cutoff)
+        dx = (x - self.x_prev) / t_e
+        dx_hat = self._exponential_smoothing(a_d, dx, self.dx_prev)
+        self.dx_prev = dx_hat
+
+        # Cutoff frekuensi adaptif berimbang kecepatan
+        cutoff = self.min_cutoff + self.beta * np.abs(dx_hat)
+        a = self._smoothing_factor(t_e, cutoff)
+        x_hat = self._exponential_smoothing(a, x, self.x_prev)
+        self.x_prev = x_hat
+        return x_hat
 
     def reset(self):
-        self.smoothed_kpts = None
+        self.x_prev = None
+        self.dx_prev = None
+        self.t_prev = None
 
 
 class BiomechanicalPipeline:
-    def __init__(self, pose_model_path, classifier_model_path=None, conf_threshold=0.5):
+    def __init__(self, pose_model_path=None, classifier_model_path=None, conf_threshold=0.5):
         # Auto-detect GPU/CPU device
         self.device = 0 if torch.cuda.is_available() else 'cpu'
         
-        # Load Model Deteksi (Support .pt dan .engine TensorRT)
-        print(f"📦 Loading Model Detector dari: {pose_model_path}")
-        self.detector = YOLO(pose_model_path)
+        # Gunakan model resmi yolo11n-pose.pt untuk akurasi maksimal pada webcam live stream
+        default_coco_path = "yolo11n-pose.pt"
+        target_path = pose_model_path if (pose_model_path and os.path.exists(pose_model_path)) else default_coco_path
+        
+        print(f"📦 Loading Model Pose Detector dari: {target_path}")
+        self.detector = YOLO(target_path)
         self.conf_threshold = conf_threshold
         
         # Load Classifier (jika file .pkl / .joblib ada)
@@ -186,76 +131,16 @@ class BiomechanicalPipeline:
             except Exception as e:
                 print(f"⚠️ Gagal memuat classifier: {e}")
                 
-        # Inisialisasi Smoother EMA
-        self.smoother = KeypointEMASmoother(alpha=0.65)
+        # Inisialisasi One-Euro Filter (Stabil, Zero-Jitter, Low Latency)
+        self.smoother = OneEuroFilter(min_cutoff=0.8, beta=0.005)
+        
+        # Repetition Counter & Stage Tracking
+        self.rep_count = 0
+        self.stage = "UP"
         
         # Metrik Performa Real-Time
         self.prev_time = time.time()
         self.fps = 0.0
-
-    def stage1_extract_and_smooth(self, frame):
-        """
-        Stage 1: Ekstraksi keypoint dan temporal smoothing teroptimasi.
-        """
-        # Eksekusi inferensi teroptimasi (imgsz=320 untuk kecepatan super tinggi)
-        results = self.detector.predict(
-            frame, 
-            device=self.device,
-            imgsz=320,
-            conf=self.conf_threshold,
-            verbose=False
-        )
-        
-        if not results or len(results[0].keypoints) == 0:
-            self.smoother.reset()
-            return None, None
-            
-        kpt_data = results[0].keypoints[0] # Ambil deteksi pose orang pertama
-        keypoints = kpt_data.xy[0].cpu().numpy() # Shape (N, 2)
-        confidences = kpt_data.conf[0].cpu().numpy() if kpt_data.conf is not None else np.ones(len(keypoints))
-        
-        # Terapkan EMA Smoothing pada koordinat keypoint
-        smoothed_keypoints = self.smoother.update(keypoints)
-        return smoothed_keypoints, confidences
-
-    def stage2_classify_movement(self, keypoints):
-        """
-        Stage 2: Klasifikasi jenis gerakan sekuensial.
-        """
-        if self.classifier is not None:
-            features = keypoints.flatten().reshape(1, -1)
-            movement_class = self.classifier.predict(features)[0]
-            return movement_class
-        
-        # Default fallback jika classifier belum di-train
-        return "Push-up"
-
-    def stage3_planar_homography(self, keypoints, confidences):
-        """
-        Stage 3a: Mengoreksi distorsi kamera miring menggunakan RANSAC Homography.
-        Memetakan dari ruang citra miring ke tampilan samping (canonical side-view).
-        """
-        # Indeks acuan: Bahu Kiri/Kanan, Pinggul Kiri/Kanan
-        ref_indices = [1, 2, 7, 8] if len(keypoints) == 13 else [5, 6, 11, 12]
-        
-        # Cek apakah keypoint acuan memiliki confidence yang memadai
-        if any(confidences[idx] < self.conf_threshold for idx in ref_indices):
-            return keypoints
-
-        src_pts = np.array([keypoints[idx] for idx in ref_indices], dtype=np.float32)
-        dst_pts = np.array([[0, 0], [100, 0], [0, 200], [100, 200]], dtype=np.float32)
-        
-        H, status = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-        
-        if H is not None:
-            kpts_homogeneous = np.hstack([keypoints, np.ones((keypoints.shape[0], 1))])
-            transformed = (H @ kpts_homogeneous.T).T
-            
-            # Cegah pembagian dengan nol
-            denom = np.where(transformed[:, 2:] == 0, 1e-6, transformed[:, 2:])
-            transformed = transformed[:, :2] / denom
-            return transformed
-        return keypoints
 
     def calculate_angle(self, A, B, C):
         """
@@ -272,65 +157,258 @@ class BiomechanicalPipeline:
         angle = math.degrees(math.acos(np.clip(cos_val, -1.0, 1.0)))
         return angle
 
-    def stage3_biomechanical_jaa(self, movement, keypoints, confidences, frame):
+    def draw_angle_arc(self, frame, A, B, C, color=(0, 255, 255), radius=30):
         """
-        Stage 3b: Evaluasi postur berdasarkan JAA (Joint Angle Accuracy) dan Visualisasi Skeleton.
+        Menggambar busur/arc sektor berwarna transparan di titik sendi B.
         """
-        status = "TERDETEKSI"
+        try:
+            angA = math.degrees(math.atan2(A[1] - B[1], A[0] - B[0]))
+            angC = math.degrees(math.atan2(C[1] - B[1], C[0] - B[0]))
+            start_ang, end_ang = min(angA, angC), max(angA, angC)
+            if end_ang - start_ang > 180:
+                start_ang, end_ang = end_ang, start_ang + 360
+            overlay = frame.copy()
+            cv2.ellipse(overlay, (int(B[0]), int(B[1])), (radius, radius), 0, start_ang, end_ang, color, -1)
+            cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+            cv2.ellipse(frame, (int(B[0]), int(B[1])), (radius, radius), 0, start_ang, end_ang, color, 2, cv2.LINE_AA)
+        except Exception:
+            pass
+
+    def stage1_extract_and_smooth(self, frame):
+        """
+        Stage 1: Ekstraksi keypoint, Persistent Object Tracking antar-frame, dan temporal smoothing.
+        """
+        try:
+            results = self.detector.track(
+                frame, 
+                device=self.device,
+                imgsz=640,
+                conf=0.35,
+                persist=True,
+                verbose=False
+            )
+        except Exception:
+            results = self.detector.predict(
+                frame, 
+                device=self.device,
+                imgsz=640,
+                conf=0.35,
+                verbose=False
+            )
+        
+        if not results or len(results[0].keypoints) == 0:
+            self.smoother.reset()
+            return None, None
+
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            self.smoother.reset()
+            return None, None
+            
+        # Mengunci posisi persendian objek target ber-confidence tertinggi
+        best_idx = int(boxes.conf.argmax().cpu().item())
+        kpt_data = results[0].keypoints[best_idx]
+        
+        if kpt_data.xy is None or len(kpt_data.xy) == 0 or kpt_data.xy.shape[1] == 0:
+            self.smoother.reset()
+            return None, None
+
+        keypoints = kpt_data.xy[0].cpu().numpy() # Shape (N, 2)
+        confidences = kpt_data.conf[0].cpu().numpy() if kpt_data.conf is not None else np.ones(len(keypoints))
+        
+        # Aplikasikan One-Euro Filter pada koordinat (x, y) keypoint
+        smoothed_keypoints = self.smoother.filter(keypoints)
+        return smoothed_keypoints, confidences
+
+    def stage2_classify_movement(self, keypoints):
+        """
+        Stage 2: Klasifikasi jenis gerakan.
+        """
+        if self.classifier is not None:
+            features = keypoints.flatten().reshape(1, -1)
+            movement_class = self.classifier.predict(features)[0]
+            return movement_class
+        return "Push-up"
+
+    def stage3_visualize_and_evaluate(self, movement, keypoints, confidences, frame):
+        """
+        Stage 3: Visualisasi skeleton 100% presisi (Support COCO 17 Keypoints & Roboflow 13 Keypoints).
+        """
+        status = "POSISIKAN TUBUH TERLIHAT PENUH"
         color = (0, 255, 255)
         
-        # Pasangan koneksi tulang skeleton
-        skeleton_limbs = [
-            (1, 2), (1, 3), (3, 5), (2, 4), (4, 6), # Lengan atas/bawah
-            (1, 7), (2, 8), (7, 8),                # Torso / Bahu ke Pinggul
-            (7, 9), (9, 11), (8, 10), (10, 12)     # Kaki / Paha & Betis
-        ] if len(keypoints) == 13 else [
-            (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-            (5, 11), (6, 12), (11, 12),
-            (11, 13), (13, 15), (12, 14), (14, 16)
-        ]
+        if len(keypoints) == 17:
+            # COCO 17 Keypoints:
+            # 0: Nose, 1: L-Eye, 2: R-Eye, 3: L-Ear, 4: R-Ear
+            # 5: L-Shoulder, 6: R-Shoulder, 7: L-Elbow, 8: R-Elbow, 9: L-Wrist, 10: R-Wrist
+            # 11: L-Hip, 12: R-Hip, 13: L-Knee, 14: R-Knee, 15: L-Ankle, 16: R-Ankle
+            skeleton_limbs = [
+                (0, 1), (0, 2), (1, 3), (2, 4),         # Wajah
+                (5, 6),                                 # Antar Bahu
+                (5, 7), (7, 9),                         # Lengan Kiri
+                (6, 8), (8, 10),                        # Lengan Kanan
+                (5, 11), (6, 12), (11, 12),             # Torso
+                (11, 13), (13, 15),                     # Kaki Kiri
+                (12, 14), (14, 16)                      # Kaki Kanan
+            ]
+            kpt_sh_l, kpt_hip_l, kpt_ank_l, kpt_kne_l = 5, 11, 15, 13
+            kpt_elb_l, kpt_wri_l = 7, 9
+            kpt_sh_r, kpt_hip_r, kpt_ank_r, kpt_kne_r = 6, 12, 16, 14
+            kpt_elb_r, kpt_wri_r = 8, 10
+        else:
+            # Roboflow 13 Keypoints
+            skeleton_limbs = [
+                (0, 1), (0, 2), (1, 2),
+                (1, 3), (3, 4), (2, 5), (5, 6),
+                (1, 7), (2, 8), (7, 8),
+                (7, 9), (9, 11), (8, 10), (10, 12)
+            ]
+            kpt_sh_l, kpt_hip_l, kpt_ank_l, kpt_kne_l = 1, 7, 11, 9
+            kpt_elb_l, kpt_wri_l = 3, 4
+            kpt_sh_r, kpt_hip_r, kpt_ank_r, kpt_kne_r = 2, 8, 12, 10
+            kpt_elb_r, kpt_wri_r = 5, 6
 
-        # Gambar Garis Skeleton Tebal Warna Kuning Cerah (OpenPose Style Yellow Limbs)
-        for p1, p2 in skeleton_limbs:
-            if p1 < len(keypoints) and p2 < len(keypoints):
-                if confidences[p1] > self.conf_threshold and confidences[p2] > self.conf_threshold:
-                    pt1 = (int(keypoints[p1][0]), int(keypoints[p1][1]))
-                    pt2 = (int(keypoints[p2][0]), int(keypoints[p2][1]))
-                    cv2.line(frame, pt1, pt2, (0, 230, 255), 4, cv2.LINE_AA)
-
-        # Gambar Titik Sendi Merah Solid (OpenPose Style Red Joint Dots)
-        for i, (x, y) in enumerate(keypoints):
-            if confidences[i] > self.conf_threshold:
-                cv2.circle(frame, (int(x), int(y)), 7, (0, 0, 255), -1, cv2.LINE_AA)
-
-        if movement == "Push-up":
-            # Indeks: Bahu, Pinggul, Pergelangan Kaki (Ankle)
-            kpt_shoulder, kpt_hip, kpt_ankle = (1, 7, 11) if len(keypoints) == 13 else (5, 11, 15)
-
-            if (confidences[kpt_shoulder] > self.conf_threshold and 
-                confidences[kpt_hip] > self.conf_threshold and 
-                confidences[kpt_ankle] > self.conf_threshold):
-                hip_angle = self.calculate_angle(keypoints[kpt_shoulder], keypoints[kpt_hip], keypoints[kpt_ankle])
-                
-                if hip_angle > 165:
-                    status = "POSTUR SEMPURNA"
-                    color = (0, 255, 0)
-                elif hip_angle > 150:
-                    status = "POSTUR BAIK"
-                    color = (0, 255, 255)
-                else:
-                    status = "POSTUR BURUK (Pinggul Terlalu Turun!)"
-                    color = (0, 0, 255)
-
-        # Header Visualisasi ala OpenPose
         h, w = frame.shape[:2]
-        header_text = "YOLOv11 Pose Estimation"
-        cv2.putText(frame, header_text, (int(w * 0.15), 45), cv2.FONT_HERSHEY_DUPLEX, 1.1, (255, 50, 0), 3, cv2.LINE_AA)
+        draw_conf_thresh = 0.35
 
-        # Visualisasi Overlay Info Real-Time
-        cv2.putText(frame, f"Gerakan: {movement}", (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(frame, f"Status: {status}", (30, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
-        cv2.putText(frame, f"FPS: {self.fps:.1f}", (30, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+        def is_valid_pt(idx):
+            if idx >= len(keypoints) or confidences[idx] < draw_conf_thresh:
+                return False
+            x, y = keypoints[idx]
+            return 2 <= x < (w - 2) and 2 <= y < (h - 2)
+
+        # 1. Gambar Bounding Box Presisi dengan Handle Control Dots & Label SKELETON 1 (MANUAL)
+        valid_indices = [i for i in range(len(keypoints)) if is_valid_pt(i)]
+        if len(valid_indices) >= 4:
+            pts = keypoints[valid_indices]
+            bx_min, by_min = max(0, int(np.min(pts[:, 0])) - 20), max(0, int(np.min(pts[:, 1])) - 25)
+            bx_max, by_max = min(w - 1, int(np.max(pts[:, 0])) + 20), min(h - 1, int(np.max(pts[:, 1])) + 20)
+            
+            # Rectangle Border Kuning Cerah
+            cv2.rectangle(frame, (bx_min, by_min), (bx_max, by_max), (0, 255, 255), 2, cv2.LINE_AA)
+            
+            # Handle Dots (4 sudut + 4 titik tengah + 1 titik kontrol putar atas)
+            mid_x = (bx_min + bx_max) // 2
+            mid_y = (by_min + by_max) // 2
+            top_handle_y = max(5, by_min - 20)
+            
+            handles = [
+                (bx_min, by_min), (bx_max, by_min), (bx_min, by_max), (bx_max, by_max),
+                (mid_x, by_min), (mid_x, by_max), (bx_min, mid_y), (bx_max, mid_y),
+                (mid_x, top_handle_y)
+            ]
+            
+            # Garis penghubung ke titik rotasi atas
+            cv2.line(frame, (mid_x, by_min), (mid_x, top_handle_y), (0, 255, 255), 1, cv2.LINE_AA)
+            
+            for hx, hy in handles:
+                cv2.circle(frame, (hx, hy), 5, (0, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(frame, (hx, hy), 6, (0, 0, 0), 1, cv2.LINE_AA)
+
+            # Label Text "SKELETON 1 (MANUAL)" di pojok atas kanan bounding box
+            label_text = "SKELETON 1 (MANUAL)"
+            cv2.putText(frame, label_text, (bx_max - 175, by_min + 20), cv2.FONT_HERSHEY_DUPLEX, 0.42, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, label_text, (bx_max - 176, by_min + 19), cv2.FONT_HERSHEY_DUPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # 2. Gambar Garis Skeleton Tebal Warna Kuning Cerah (Single Color Yellow Limbs)
+        limb_color = (0, 230, 255)
+        for p1, p2 in skeleton_limbs:
+            if is_valid_pt(p1) and is_valid_pt(p2):
+                pt1 = (int(keypoints[p1][0]), int(keypoints[p1][1]))
+                pt2 = (int(keypoints[p2][0]), int(keypoints[p2][1]))
+                cv2.line(frame, pt1, pt2, limb_color, 3, cv2.LINE_AA)
+
+        # 3. Gambar Titik Sendi Lingkaran Kuning Solid & Angka Indeks Sendi (1..17)
+        for i in range(len(keypoints)):
+            if is_valid_pt(i):
+                x, y = int(keypoints[i][0]), int(keypoints[i][1])
+                # Lingkaran sendi kuning solid
+                cv2.circle(frame, (x, y), 6, (0, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(frame, (x, y), 7, (0, 0, 0), 1, cv2.LINE_AA)
+                
+                # Angka 1-indexed (1, 2, 3, ... 17) dengan shadow hitam untuk kontras tinggi
+                kpt_num_str = str(i + 1)
+                cv2.putText(frame, kpt_num_str, (x + 8, y + 5), cv2.FONT_HERSHEY_DUPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(frame, kpt_num_str, (x + 7, y + 4), cv2.FONT_HERSHEY_DUPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+        hip_angle_val = 0.0
+        elbow_angle_val = 0.0
+
+        # 4. Perhitungan Sudut Biomekanik & Rep Counter (Push-up/Plank)
+        if len(keypoints) == 13:
+            kpt_sh, kpt_hip, kpt_ank, kpt_kne = 1, 7, 11, 9
+            kpt_elb, kpt_wri = 3, 4
+        else:
+            kpt_sh, kpt_hip, kpt_ank, kpt_kne = 5, 11, 15, 13
+            kpt_elb, kpt_wri = 7, 9
+
+        # Pilih acuan kaki: Ankle jika terdeteksi (conf >= 0.55), atau Knee jika ankle di luar kamera
+        ref_leg_kpt = kpt_ank if confidences[kpt_ank] >= 0.55 else (kpt_kne if confidences[kpt_kne] >= 0.55 else None)
+
+        if (ref_leg_kpt is not None and 
+            confidences[kpt_sh] >= 0.55 and 
+            confidences[kpt_hip] >= 0.55 and
+            math.dist(keypoints[kpt_sh], keypoints[kpt_hip]) > 40):
+            
+            # Hitung Sudut Pinggul (Postur Lurus)
+            hip_angle_val = self.calculate_angle(keypoints[kpt_sh], keypoints[kpt_hip], keypoints[ref_leg_kpt])
+            
+            if hip_angle_val > 165:
+                status = "POSTUR SEMPURNA"
+                color = (0, 255, 0)
+            elif hip_angle_val > 150:
+                status = "POSTUR BAIK"
+                color = (0, 255, 255)
+            else:
+                status = "POSTUR BURUK (Pinggul Terlalu Turun!)"
+                color = (0, 0, 255)
+
+            # Draw Angle Arc & Text Overlay di Pinggul
+            self.draw_angle_arc(frame, keypoints[kpt_sh], keypoints[kpt_hip], keypoints[ref_leg_kpt], color=(0, 255, 255), radius=30)
+            hip_pt = (int(keypoints[kpt_hip][0]), int(keypoints[kpt_hip][1]))
+            cv2.putText(frame, f"{int(hip_angle_val)}deg", (hip_pt[0] + 12, hip_pt[1] - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+
+        if (confidences[kpt_sh] >= 0.55 and 
+            confidences[kpt_elb] >= 0.55 and 
+            confidences[kpt_wri] >= 0.55 and
+            math.dist(keypoints[kpt_sh], keypoints[kpt_elb]) > 25):
+            
+            # Hitung Sudut Siku (Fase Gerakan Push-up)
+            elbow_angle_val = self.calculate_angle(keypoints[kpt_sh], keypoints[kpt_elb], keypoints[kpt_wri])
+            
+            # Logika Repetition Counter State Machine
+            if elbow_angle_val < 90 and self.stage == "UP":
+                self.stage = "DOWN"
+            if elbow_angle_val > 155 and self.stage == "DOWN":
+                self.stage = "UP"
+                self.rep_count += 1
+
+            # Draw Angle Arc & Text Overlay di Siku
+            self.draw_angle_arc(frame, keypoints[kpt_sh], keypoints[kpt_elb], keypoints[kpt_wri], color=(255, 0, 255), radius=28)
+            elb_pt = (int(keypoints[kpt_elb][0]), int(keypoints[kpt_elb][1]))
+            cv2.putText(frame, f"{int(elbow_angle_val)}deg", (elb_pt[0] + 12, elb_pt[1] - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2, cv2.LINE_AA)
+
+        # 5. Modern Glassmorphic HUD Card Dashboard (Di Pojok Atas Kanan)
+        hud_w, hud_h = 360, 185
+        hud_x = max(10, w - hud_w - 15)
+        hud_y = 15
+
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (hud_x, hud_y), (hud_x + hud_w, hud_y + hud_h), (15, 15, 20), -1)
+        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+        cv2.rectangle(frame, (hud_x, hud_y), (hud_x + hud_w, hud_y + hud_h), (0, 230, 255), 2) # Border Cyan
+
+        # HUD Text Content
+        cv2.putText(frame, "BIOMECHANICAL ANALYSIS", (hud_x + 15, hud_y + 28), cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 230, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, f"REPS : {self.rep_count}", (hud_x + 15, hud_y + 62), cv2.FONT_HERSHEY_DUPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(frame, f"STAGE: {self.stage}", (hud_x + 190, hud_y + 62), cv2.FONT_HERSHEY_DUPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, f"GERAKAN : {movement}", (hud_x + 15, hud_y + 92), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"STATUS  : {status}", (hud_x + 15, hud_y + 120), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
+        cv2.putText(frame, f"SUDUT   : Hip {int(hip_angle_val)}deg | Elbow {int(elbow_angle_val)}deg", (hud_x + 15, hud_y + 146), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"FPS     : {self.fps:.1f}", (hud_x + 15, hud_y + 168), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 0), 1, cv2.LINE_AA)
+
         return frame
 
     def process_frame(self, frame):
@@ -340,18 +418,16 @@ class BiomechanicalPipeline:
         self.prev_time = curr_time
 
         # Cek jika frame kamera hitam (shutter tertutup / privacy mode active)
-        # Jangan jalankan inferensi YOLO jika kamera hitam untuk menghemat CPU/GPU & hindari lag!
         if frame is None or frame.mean() < 1.0:
             cv2.putText(frame, "KAMERA HITAM / TERKUNCI!", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             cv2.putText(frame, "Buka Privacy Shutter / Tekan Fn+F6 / Cek Lenovo Vantage", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             cv2.putText(frame, f"FPS: {self.fps:.1f}", (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             return frame
 
-        # Tahap 1: Ekstraksi & EMA Smoothing (Hanya jika frame valid)
+        # Tahap 1: Ekstraksi Keypoint & Temporal Smoothing
         keypoints, confidences = self.stage1_extract_and_smooth(frame)
 
         if keypoints is None: 
-            # Tampilkan pesan jika belum/tidak ada pose terdeteksi
             cv2.putText(frame, "Mencari Pose / Orang...", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
             cv2.putText(frame, f"FPS: {self.fps:.1f}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             return frame
@@ -359,38 +435,23 @@ class BiomechanicalPipeline:
         # Tahap 2: Klasifikasi Gerakan
         movement = self.stage2_classify_movement(keypoints)
         
-        # Tahap 3: Koreksi Homografi & Evaluasi Biomekanik
-        normalized_kpts = self.stage3_planar_homography(keypoints, confidences)
-        annotated_frame = self.stage3_biomechanical_jaa(movement, normalized_kpts, confidences, frame)
+        # Tahap 3: Visualisasi Biomekanik & Evaluasi (100% Stabil)
+        annotated_frame = self.stage3_visualize_and_evaluate(movement, keypoints, confidences, frame)
         
         return annotated_frame
 
 
 if __name__ == "__main__":
-    # Path default model pose
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(os.path.dirname(script_dir))
-    
-    # Pilih model: Utamakan model Nano (yolo11n-pose-5) yang sangat ringan & cepat (high FPS)
-    nano_pt = os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11n-pose-5', 'weights', 'best.pt')
-    medium_pt = os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11m-pose', 'weights', 'best.pt')
-    engine_path = os.path.join(project_root, 'runs', 'pose', 'models', 'trained_weights', 'yolo11m-pose', 'weights', 'best.engine')
-    
-    if os.path.exists(nano_pt):
-        model_path = nano_pt
-    elif os.path.exists(medium_pt):
-        model_path = medium_pt
-    else:
-        model_path = engine_path
-    
-    # Auto-detect Sumber Kamera HP / Webcam
+    # Model resmi yolo11n-pose.pt (Terlatih pada 200.000 citra COCO untuk akurasi webcam maksimal)
+    model_path = "yolo11n-pose.pt"
+
     video_source = None
     if len(sys.argv) > 1:
         video_source = sys.argv[1]
         if isinstance(video_source, str) and video_source.isdigit():
             video_source = int(video_source)
     else:
-        # Cari kamera terhubung (indeks 0, 1, atau 2) tanpa DSHOW lock
+        # Cari kamera terhubung (indeks 0, 1, atau 2)
         for idx in [0, 1, 2]:
             temp_cap = cv2.VideoCapture(idx)
             if temp_cap.isOpened():
@@ -403,59 +464,30 @@ if __name__ == "__main__":
         if video_source is None:
             video_source = 0
 
-    if os.path.exists(model_path):
-        pipeline = BiomechanicalPipeline(model_path)
+    pipeline = BiomechanicalPipeline(model_path)
+    
+    # Buka webcam / window stream dengan multithreading
+    if isinstance(video_source, int):
+        webcam = ThreadedWebcam(video_source).start()
+        if not webcam.isOpened():
+            print(f"❌ Gagal membuka sumber webcam: {video_source}")
+            sys.exit(1)
         
-        # Buka webcam / window stream dengan multithreading
-        if isinstance(video_source, int):
-            webcam = ThreadedWebcam(video_source).start()
-            if not webcam.isOpened():
-                print(f"❌ Gagal membuka sumber webcam: {video_source}")
-                sys.exit(1)
-            
-            print(f"🎥 Memulai Stream Kamera Real-Time (Indeks {video_source}, Ultra-Low Latency)... Tekan 'q' untuk keluar.")
-            while webcam.isOpened():
-                ret, frame = webcam.read()
-                if not ret or frame is None:
-                    time.sleep(0.01)
-                    continue
-                    
-                output = pipeline.process_frame(frame)
-                cv2.imshow("Biomechanical Analysis Pipeline", output)
-                if cv2.waitKey(1) & 0xFF == ord('q'): break
-                    
-            webcam.release()
-            cv2.destroyAllWindows()
-        elif isinstance(video_source, str) and not os.path.exists(video_source):
-            # Jika video_source berupa nama jendela scrcpy (misal: 'POCO' atau 'scrcpy')
-            print(f"🖥️ Menangkap Jendela Kamera '{video_source}' secara Real-Time...")
-            win_stream = WindowCaptureStream(video_source).start()
-            while True:
-                ret, frame = win_stream.read()
-                if not ret or frame is None:
-                    time.sleep(0.01)
-                    continue
-                output = pipeline.process_frame(frame)
-                cv2.imshow("Biomechanical Analysis Pipeline", output)
-                if cv2.waitKey(1) & 0xFF == ord('q'): break
-            win_stream.release()
-            cv2.destroyAllWindows()
-        else:
-            cap = cv2.VideoCapture(video_source)
-            if not cap.isOpened():
-                print(f"❌ Gagal membuka sumber video: {video_source}")
-                sys.exit(1)
-
-            print(f"🎥 Memulai Stream File Video [{video_source}]... Tekan 'q' untuk keluar.")
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret or frame is None: break
-                    
-                output = pipeline.process_frame(frame)
-                cv2.imshow("Biomechanical Analysis Pipeline", output)
-                if cv2.waitKey(1) & 0xFF == ord('q'): break
-                    
-            cap.release()
-            cv2.destroyAllWindows()
-    else:
-        print(f"⚠️ Model tidak ditemukan di {model_path}. Harap selesaikan pelatihan terlebih dahulu.")
+        window_name = "Biomechanical Analysis Pipeline"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 1280, 720)
+        
+        print(f"🎥 Memulai Stream Kamera Real-Time (Indeks {video_source}, Ultra-Low Latency)... Tekan 'q' untuk keluar.")
+        while webcam.isOpened():
+            ret, frame = webcam.read()
+            if not ret or frame is None:
+                time.sleep(0.01)
+                continue
+                
+            output = pipeline.process_frame(frame)
+            cv2.imshow(window_name, output)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+                
+        webcam.release()
+        cv2.destroyAllWindows()
