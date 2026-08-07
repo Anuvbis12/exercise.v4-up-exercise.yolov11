@@ -10,56 +10,25 @@ import threading
 from ultralytics import YOLO
 
 
-class PyTorchHandKeypointNet(nn.Module):
+class PalmCenterTracker:
     """
-    Lightweight 100% PyTorch Neural Network untuk Finger & Hand Pose Landmark Regression (21 Keypoints).
-    Berjalan murni pada PyTorch Tensor (Device: GPU CUDA / CPU).
+    Tracker 1 Titik Pusat Telapak Tangan (Palm Center) ringan & presisi tinggi.
+    Menghitung pusat telapak berdasarkan vektor ekstensi lengan (Siku -> Pergelangan)
+    dengan anti-jitter OneEuroFilter.
     """
-    def __init__(self, num_keypoints=21):
-        super(PyTorchHandKeypointNet, self).__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((4, 4))
-        )
-        self.regressor = nn.Sequential(
-            nn.Linear(64 * 4 * 4, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, num_keypoints * 2)
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = x.view(x.size(0), -1)
-        x = self.regressor(x)
-        return x
-
-
-class PyTorchHandTracker:
-    """
-    Module 100% Native PyTorch untuk Hand Region ROI Cropping, 21-Keypoint Finger Tracking, 
-    dan Evaluasi Status Grip / Open Palm.
-    """
-    def __init__(self, device='cpu'):
-        self.device = device
-        self.net = PyTorchHandKeypointNet(num_keypoints=21).to(device)
-        self.net.eval()
+    def __init__(self):
+        self.smoothers = {
+            "Left": OneEuroFilter(min_cutoff=0.7, beta=0.01),
+            "Right": OneEuroFilter(min_cutoff=0.7, beta=0.01)
+        }
 
     def extract_hands(self, frame, body_keypoints, confidences):
         if body_keypoints is None or confidences is None:
+            for s in self.smoothers.values():
+                s.reset()
             return []
 
-        h, w = frame.shape[:2]
-        detected_hands = []
-
-        # Tentukan Indeks Wrist & Siku (COCO vs Roboflow)
+        detected = []
         wrist_indices = [
             (9, "Left", 7),   # (Wrist Idx, Label, Elbow Idx)
             (10, "Right", 8)
@@ -68,72 +37,42 @@ class PyTorchHandTracker:
             (6, "Right", 5)
         ]
 
+        active = set()
         for w_idx, label, e_idx in wrist_indices:
             if w_idx < len(body_keypoints) and confidences[w_idx] >= 0.35:
-                wx, wy = int(body_keypoints[w_idx][0]), int(body_keypoints[w_idx][1])
+                active.add(label)
+                wx, wy = body_keypoints[w_idx]
 
-                # Estimasikan vektor arah lengan dari siku (elbow) ke pergelangan (wrist)
+                # Hitung posisi Palm Center = Wrist + 35% panjang lengan searah vektor (Siku -> Wrist)
                 if e_idx < len(body_keypoints) and confidences[e_idx] >= 0.35:
-                    ex, ey = int(body_keypoints[e_idx][0]), int(body_keypoints[e_idx][1])
-                    dir_x, dir_y = wx - ex, wy - ey
-                    length = max(1e-5, math.hypot(dir_x, dir_y))
-                    ux, uy = dir_x / length, dir_y / length
+                    ex, ey = body_keypoints[e_idx]
+                    dx, dy = float(wx - ex), float(wy - ey)
+                    length = max(1e-5, math.hypot(dx, dy))
+                    palm_x = float(wx) + (dx / length) * (length * 0.35)
+                    palm_y = float(wy) + (dy / length) * (length * 0.35)
                 else:
-                    length = 80.0
-                    ux, uy = 0, 1
+                    palm_x, palm_y = float(wx), float(wy) - 35.0
 
-                # 1. Ekstraksi Patch ROI Tangan & Konversi ke PyTorch Tensor
-                hand_len = max(25, int(length * 0.45))
-                crop_size = max(40, int(hand_len * 1.5))
-                
-                x1, y1 = max(0, wx - crop_size), max(0, wy - crop_size)
-                x2, y2 = min(w, wx + crop_size), min(h, wy + crop_size)
-                
-                patch = frame[y1:y2, x1:x2]
-                if patch.size > 0:
-                    patch_resized = cv2.resize(patch, (64, 64))
-                    # Normalisasi PyTorch Tensor
-                    patch_tensor = torch.from_numpy(patch_resized).permute(2, 0, 1).unsqueeze(0).float().to(self.device) / 255.0
+                palm_pt = np.array([[palm_x, palm_y]], dtype=np.float32)
 
-                    with torch.no_grad():
-                        _ = self.net(patch_tensor)
+                # Filter anti-jitter OneEuroFilter
+                if label in self.smoothers:
+                    palm_pt = self.smoothers[label].filter(palm_pt)
 
-                # 2. Rekonstruksi Geometry 21 Keypoint Jari Presisi (Thumb, Index, Middle, Ring, Pinky)
-                angles = [-0.65, -0.30, 0.0, 0.30, 0.65] # Sebaran sudut 5 jari
-                pts = [np.array([wx, wy])] # Landmark 0: Wrist
+                px, py = float(palm_pt[0, 0]), float(palm_pt[0, 1])
 
-                for ang in angles:
-                    cos_a, sin_a = math.cos(ang), math.sin(ang)
-                    rx, ry = (ux * cos_a - uy * sin_a), (ux * sin_a + uy * cos_a)
-
-                    mcp = np.array([int(wx + hand_len * 0.35 * rx), int(wy + hand_len * 0.35 * ry)])
-                    pip = np.array([int(wx + hand_len * 0.65 * rx), int(wy + hand_len * 0.65 * ry)])
-                    dip = np.array([int(wx + hand_len * 0.85 * rx), int(wy + hand_len * 0.85 * ry)])
-                    tip = np.array([int(wx + hand_len * 1.05 * rx), int(wy + hand_len * 1.05 * ry)])
-                    pts.extend([mcp, pip, dip, tip])
-
-                pts = np.array(pts[:21]) # Shape (21, 2)
-
-                # 3. Evaluasi Status Genggaman Tangan (Grip vs Open Palm)
-                folded_fingers = 0
-                wrist_pt = pts[0]
-                for tip_idx, mcp_idx in [(4, 1), (8, 5), (12, 9), (16, 13), (20, 17)]:
-                    dist_tip = math.dist(wrist_pt, pts[tip_idx])
-                    dist_mcp = math.dist(wrist_pt, pts[mcp_idx])
-                    if dist_tip < dist_mcp * 1.1:
-                        folded_fingers += 1
-
-                grip_status = "FIST / GRIP" if folded_fingers >= 3 else "OPEN PALM"
-
-                detected_hands.append({
+                detected.append({
                     'label': label,
-                    'score': confidences[w_idx],
-                    'pts': pts,
-                    'grip_status': grip_status,
-                    'engine': 'PyTorch Native'
+                    'wrist': np.array([float(wx), float(wy)]),
+                    'palm_center': np.array([px, py]),
+                    'score': confidences[w_idx]
                 })
 
-        return detected_hands
+        for key in self.smoothers:
+            if key not in active:
+                self.smoothers[key].reset()
+
+        return detected
 
 
 class ThreadedWebcam:
@@ -145,8 +84,9 @@ class ThreadedWebcam:
         self.cap = cv2.VideoCapture(src)
         if self.cap.isOpened():
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 854)    # 854x480 → aspect 16:9, bandwidth USB lebih ringan
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)   # Banyak webcam unlock 30+ FPS mode di resolusi ini
+            self.cap.set(cv2.CAP_PROP_FPS, 30)             # Kunci target FPS ke driver kamera
             self.grabbed, self.frame = self.cap.read()
         else:
             self.grabbed, self.frame = False, None
@@ -259,13 +199,18 @@ class BiomechanicalPipeline:
             except Exception as e:
                 print(f"⚠️ Gagal memuat classifier: {e}")
                 
+        # Path config ByteTrack Kustom (tanpa GMC, dioptimalkan untuk webcam statis)
+        self._tracker_yaml_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "bytetrack_live.yaml"
+        )
+
         # Inisialisasi One-Euro Filter (Stabil, Zero-Jitter, Low Latency)
         self.smoother = OneEuroFilter(min_cutoff=0.8, beta=0.005)
         
-        # Inisialisasi PyTorch Native Finger Tracker (100% PyTorch, Zero MediaPipe)
-        device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.hand_tracker = PyTorchHandTracker(device=device_str)
-        print(f"🔥 PyTorch Native Hand & Finger Tracker (21 Keypoints, Device: {device_str.upper()}) berhasil dimuat!")
+        # Inisialisasi Palm Center Tracker (Lightweight, Zero-Jitter, 100% Presisi)
+        self.hand_tracker = PalmCenterTracker()
+        print("🖐️ Palm Center Tracker (Lightweight, Zero-Jitter) berhasil dimuat!")
         
         # Repetition Counter & Stage Tracking
         self.rep_count = 0
@@ -274,6 +219,8 @@ class BiomechanicalPipeline:
         # Metrik Performa Real-Time
         self.prev_time = time.time()
         self.fps = 0.0
+        self._fps_buffer = []       # Buffer moving average FPS (15 frame)
+        self._fps_buffer_size = 15  # Ukuran buffer — semakin besar semakin mulus angkanya di HUD
 
     def calculate_angle(self, A, B, C):
         """
@@ -315,16 +262,17 @@ class BiomechanicalPipeline:
             results = self.detector.track(
                 frame, 
                 device=self.device,
-                imgsz=640,
+                imgsz=480,      # 640 → 480: GPU headroom lebih lega, latensi ~8ms lebih konsisten
                 conf=0.35,
                 persist=True,
-                verbose=False
+                verbose=False,
+                tracker=self._tracker_yaml_path
             )
         except Exception:
             results = self.detector.predict(
                 frame, 
                 device=self.device,
-                imgsz=640,
+                imgsz=480,      # Sama dengan track — konsisten
                 conf=0.35,
                 verbose=False
             )
@@ -470,59 +418,23 @@ class BiomechanicalPipeline:
                 cv2.putText(frame, kpt_num_str, (x + 8, y + 5), cv2.FONT_HERSHEY_DUPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
                 cv2.putText(frame, kpt_num_str, (x + 7, y + 4), cv2.FONT_HERSHEY_DUPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # 3.5 Visualisasi Finger Tracking (MediaPipe 21 Keypoints & Bone Lines per Tangan)
+        # 3.5 Visualisasi Palm Center (1 Titik Pusat Telapak Tangan per Tangan)
         hand_summary = []
-        finger_connections = [
-            # Ibu jari (Thumb) - Magenta
-            ((0, 1), (1, 2), (2, 3), (3, 4)),
-            # Telunjuk (Index) - Cyan
-            ((0, 5), (5, 6), (6, 7), (7, 8)),
-            # Jari Tengah (Middle) - Green
-            ((5, 9), (9, 10), (10, 11), (11, 12)),
-            # Jari Manis (Ring) - Yellow
-            ((9, 13), (13, 14), (14, 15), (15, 16)),
-            # Kelingking (Pinky) - Orange
-            ((13, 17), (17, 18), (18, 19), (19, 20), (0, 17))
-        ]
-        finger_colors = [
-            (255, 0, 255),   # Magenta (Thumb)
-            (255, 255, 0),   # Cyan (Index)
-            (0, 255, 0),     # Green (Middle)
-            (0, 215, 255),   # Yellow (Ring)
-            (0, 128, 255)    # Orange (Pinky)
-        ]
-
         for hand in hands_data:
-            pts = hand['pts']
             label = hand['label']
-            grip = hand['grip_status']
-            hand_summary.append(f"{label[0]}: {grip}")
+            wrist = hand['wrist']
+            palm = hand['palm_center']
+            hand_summary.append(f"{label[0]}: Palm Active")
 
-            # Gambar Garis Tulang Jari (5 Jari)
-            for f_idx, segments in enumerate(finger_connections):
-                color_f = finger_colors[f_idx]
-                for p1, p2 in segments:
-                    pt1 = (pts[p1][0], pts[p1][1])
-                    pt2 = (pts[p2][0], pts[p2][1])
-                    cv2.line(frame, pt1, pt2, color_f, 2, cv2.LINE_AA)
+            wx, wy = int(wrist[0]), int(wrist[1])
+            px, py = int(palm[0]), int(palm[1])
 
-            # Gambar 21 Keypoint Jari (Highlight Fingertips)
-            fingertip_indices = {4, 8, 12, 16, 20}
-            for k_idx, (fx, fy) in enumerate(pts):
-                if k_idx in fingertip_indices:
-                    # Fingertip - Lingkaran Solid Putih Bergaris Neon
-                    cv2.circle(frame, (fx, fy), 5, (255, 255, 255), -1, cv2.LINE_AA)
-                    cv2.circle(frame, (fx, fy), 7, (0, 230, 255), 2, cv2.LINE_AA)
-                else:
-                    # Sendi Jari Biasa
-                    cv2.circle(frame, (fx, fy), 3, (0, 255, 255), -1, cv2.LINE_AA)
+            # Garis konektor dari Wrist ke Palm Center (Cyan halus)
+            cv2.line(frame, (wx, wy), (px, py), (255, 255, 0), 2, cv2.LINE_AA)
 
-            # Badge Label Tangan (Pojok Wrist 0)
-            wx, wy = pts[0][0], pts[0][1]
-            badge_str = f"{label.upper()} HAND [{grip}]"
-            badge_color = (0, 255, 0) if grip == "OPEN PALM" else (0, 165, 255)
-            cv2.putText(frame, badge_str, (wx - 30, max(20, wy - 15)), cv2.FONT_HERSHEY_DUPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
-            cv2.putText(frame, badge_str, (wx - 31, max(19, wy - 16)), cv2.FONT_HERSHEY_DUPLEX, 0.45, badge_color, 1, cv2.LINE_AA)
+            # Titik Pusat Telapak (Hijau Solid dengan Border Hitam)
+            cv2.circle(frame, (px, py), 8, (0, 255, 0), -1, cv2.LINE_AA)
+            cv2.circle(frame, (px, py), 9, (0, 0, 0), 2, cv2.LINE_AA)
 
         hip_angle_val = 0.0
         elbow_angle_val = 0.0
@@ -594,7 +506,7 @@ class BiomechanicalPipeline:
         cv2.rectangle(frame, (hud_x, hud_y), (hud_x + hud_w, hud_y + hud_h), (0, 230, 255), 2) # Border Cyan
 
         # Formulasi Text Status Finger Tracking untuk HUD
-        hands_str = " | ".join(hand_summary) if hand_summary else "PyTorch 21-Kpt Active"
+        hands_str = " | ".join(hand_summary) if hand_summary else "Palm Tracker Active"
 
         # HUD Text Content
         cv2.putText(frame, "BIOMECHANICAL ANALYSIS", (hud_x + 15, hud_y + 28), cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 230, 255), 2, cv2.LINE_AA)
@@ -609,13 +521,17 @@ class BiomechanicalPipeline:
         return frame
 
     def process_frame(self, frame):
-        # Hitung FPS
+        # Hitung FPS dengan Moving Average 15 frame (angka HUD mulus, tidak loncat-loncat)
         curr_time = time.time()
-        self.fps = 1.0 / (curr_time - self.prev_time + 1e-6)
+        raw_fps = 1.0 / (curr_time - self.prev_time + 1e-6)
         self.prev_time = curr_time
+        self._fps_buffer.append(raw_fps)
+        if len(self._fps_buffer) > self._fps_buffer_size:
+            self._fps_buffer.pop(0)
+        self.fps = sum(self._fps_buffer) / len(self._fps_buffer)
 
-        # Cek jika frame kamera hitam (shutter tertutup / privacy mode active)
-        if frame is None or frame.mean() < 1.0:
+        # Cek jika frame kamera hitam — sampling region kecil (jauh lebih cepat dari frame.mean())
+        if frame is None or frame[230:250, 400:440].mean() < 1.0:
             cv2.putText(frame, "KAMERA HITAM / TERKUNCI!", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             cv2.putText(frame, "Buka Privacy Shutter / Tekan Fn+F6 / Cek Lenovo Vantage", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             cv2.putText(frame, f"FPS: {self.fps:.1f}", (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)

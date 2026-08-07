@@ -1,0 +1,20 @@
+# bytetrack_live.yaml
+# Custom ByteTrack config — Tuned untuk webcam live stream, single-person exercise tracking
+# Tidak menggunakan GMC (Global Motion Compensation) — tidak dibutuhkan untuk kamera statis
+
+tracker_type: bytetrack
+
+# ── Threshold Deteksi ──────────────────────────────────────────────────────────
+track_high_thresh: 0.35   # Lebih tinggi dari default (0.25) → tolak noise/deteksi palsu
+track_low_thresh: 0.15    # Lebih tinggi dari default (0.10) → pemulihan ID saat okludif
+
+# ── Kontrol Track Baru ─────────────────────────────────────────────────────────
+new_track_thresh: 0.35    # Sama dengan track_high_thresh → ID baru hanya dibuat jika deteksi kuat
+
+# ── Buffer & Pemulihan ─────────────────────────────────────────────────────────
+track_buffer: 40          # Default 30 → 40 frame (~1.3 detik @ 30fps)
+                          # Memberi toleransi saat pose push-up bawah / sebagian tubuh keluar frame
+
+# ── Pencocokan Antar Frame ─────────────────────────────────────────────────────
+match_thresh: 0.85        # Lebih ketat dari default (0.80) → cegah ID-swap jika ada orang lewat
+fuse_score: True          # Gabungkan skor YOLO + IoU untuk keputusan pencocokan yang lebih stabil
