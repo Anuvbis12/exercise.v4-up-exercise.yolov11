@@ -176,6 +176,29 @@ class OneEuroFilter:
         self.t_prev = None
 
 
+# ── Warna skeleton & HUD per orang (BGR) ─────────────────────────────────────────────
+_PERSON_COLORS = [
+    (0, 230, 255),    # Person 0 — Cyan Kuning (orisinal)
+    (80, 255, 80),    # Person 1 — Hijau Neon
+    (0, 140, 255),    # Person 2 — Orange
+]
+
+
+class PersonState:
+    """
+    Menyimpan seluruh state analisis biomekanik untuk 1 orang tertentu.
+    Di-instansiasi per track_id; dihapus otomatis setelah PERSON_TIMEOUT detik.
+    """
+    def __init__(self):
+        self.smoother      = OneEuroFilter(min_cutoff=0.8, beta=0.005)
+        self.hand_tracker  = PalmCenterTracker()
+        self.rep_count     = 0
+        self.stage         = "UP"
+        self._depth_buffer = []
+        self.depth_pct     = 100.0
+        self.last_seen     = time.time()  # Deteksi terakhir untuk GC otomatis
+
+
 class BiomechanicalPipeline:
     def __init__(self, pose_model_path=None, classifier_model_path=None, conf_threshold=0.5):
         # Auto-detect GPU/CPU device
@@ -205,22 +228,22 @@ class BiomechanicalPipeline:
             "bytetrack_live.yaml"
         )
 
-        # Inisialisasi One-Euro Filter (Stabil, Zero-Jitter, Low Latency)
-        self.smoother = OneEuroFilter(min_cutoff=0.8, beta=0.005)
-        
-        # Inisialisasi Palm Center Tracker (Lightweight, Zero-Jitter, 100% Presisi)
-        self.hand_tracker = PalmCenterTracker()
-        print("🖐️ Palm Center Tracker (Lightweight, Zero-Jitter) berhasil dimuat!")
-        
-        # Repetition Counter & Stage Tracking
-        self.rep_count = 0
-        self.stage = "UP"
-        
-        # Metrik Performa Real-Time
-        self.prev_time = time.time()
-        self.fps = 0.0
-        self._fps_buffer = []       # Buffer moving average FPS (15 frame)
-        self._fps_buffer_size = 15  # Ukuran buffer — semakin besar semakin mulus angkanya di HUD
+        # Inisialisasi state multi-person
+        self.persons        = {}   # dict: track_id (int) → PersonState
+        self.MAX_PERSONS    = 3    # Batas maksimal orang yang diproses bersamaan
+        self.PERSON_TIMEOUT = 5.0  # Detik sebelum state orang yang hilang dihapus
+
+        # Konstanta sudut Push-Up Depth Indicator (dibagi semua orang)
+        self.PUSHUP_ANGLE_DOWN = 60.0
+        self.PUSHUP_ANGLE_UP   = 160.0
+
+        # Metrik Performa Real-Time (FPS counter)
+        self.prev_time        = time.time()
+        self.fps              = 0.0
+        self._fps_buffer      = []   # Moving average FPS (15 frame)
+        self._fps_buffer_size = 15
+
+        print("👥 Multi-Person Tracker: maks. 3 orang aktif")
 
     def calculate_angle(self, A, B, C):
         """
@@ -256,13 +279,15 @@ class BiomechanicalPipeline:
 
     def stage1_extract_and_smooth(self, frame):
         """
-        Stage 1: Ekstraksi keypoint, Persistent Object Tracking antar-frame, dan temporal smoothing.
+        Stage 1: Deteksi pose semua orang (maks. MAX_PERSONS), tracking per ID,
+        temporal smoothing per person, dan GC state orang yang sudah hilang.
+        Return: list of dict {track_id, keypoints, confidences}
         """
         try:
             results = self.detector.track(
-                frame, 
+                frame,
                 device=self.device,
-                imgsz=480,      # 640 → 480: GPU headroom lebih lega, latensi ~8ms lebih konsisten
+                imgsz=480,
                 conf=0.35,
                 persist=True,
                 verbose=False,
@@ -270,36 +295,69 @@ class BiomechanicalPipeline:
             )
         except Exception:
             results = self.detector.predict(
-                frame, 
+                frame,
                 device=self.device,
-                imgsz=480,      # Sama dengan track — konsisten
+                imgsz=480,
                 conf=0.35,
                 verbose=False
             )
-        
+
         if not results or len(results[0].keypoints) == 0:
-            self.smoother.reset()
-            return None, None
+            return []
 
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
-            self.smoother.reset()
-            return None, None
-            
-        # Mengunci posisi persendian objek target ber-confidence tertinggi
-        best_idx = int(boxes.conf.argmax().cpu().item())
-        kpt_data = results[0].keypoints[best_idx]
-        
-        if kpt_data.xy is None or len(kpt_data.xy) == 0 or kpt_data.xy.shape[1] == 0:
-            self.smoother.reset()
-            return None, None
+            return []
 
-        keypoints = kpt_data.xy[0].cpu().numpy() # Shape (N, 2)
-        confidences = kpt_data.conf[0].cpu().numpy() if kpt_data.conf is not None else np.ones(len(keypoints))
-        
-        # Aplikasikan One-Euro Filter pada koordinat (x, y) keypoint
-        smoothed_keypoints = self.smoother.filter(keypoints)
-        return smoothed_keypoints, confidences
+        # ── Ambil track IDs (ByteTrack) ───────────────────────────────────────────
+        confs   = boxes.conf.cpu().numpy()
+        if boxes.id is not None:
+            tids = boxes.id.int().cpu().numpy()
+        else:
+            # Fallback saat tracking ID belum tersedia (frame pertama)
+            tids = np.arange(len(confs), dtype=int)
+
+        # Urutkan berdasarkan confidence tertinggi, ambil maks. MAX_PERSONS
+        order = np.argsort(confs)[::-1][:self.MAX_PERSONS]
+
+        now = time.time()
+        detected = []
+
+        for rank, idx in enumerate(order):
+            tid = int(tids[idx])
+            kpt_data = results[0].keypoints[idx]
+            if kpt_data.xy is None or kpt_data.xy.shape[1] == 0:
+                continue
+
+            keypoints   = kpt_data.xy[0].cpu().numpy()
+            confidences = (kpt_data.conf[0].cpu().numpy()
+                           if kpt_data.conf is not None
+                           else np.ones(len(keypoints)))
+
+            # Buat PersonState baru jika ID belum dikenal
+            if tid not in self.persons:
+                self.persons[tid] = PersonState()
+
+            pstate = self.persons[tid]
+            pstate.last_seen = now
+
+            # Aplikasikan OneEuroFilter milik orang ini
+            smoothed = pstate.smoother.filter(keypoints)
+
+            detected.append({
+                'track_id':   tid,
+                'rank':       rank,          # 0 = paling percaya diri
+                'keypoints':  smoothed,
+                'confidences': confidences,
+            })
+
+        # ── GC: hapus state orang yang sudah hilang > PERSON_TIMEOUT ────────────
+        stale = [tid for tid, ps in self.persons.items()
+                 if (now - ps.last_seen) > self.PERSON_TIMEOUT]
+        for tid in stale:
+            del self.persons[tid]
+
+        return detected
 
     def stage1_5_extract_and_smooth_hands(self, frame, body_keypoints=None, confidences=None):
         """
@@ -317,12 +375,17 @@ class BiomechanicalPipeline:
             return movement_class
         return "Push-up"
 
-    def stage3_visualize_and_evaluate(self, movement, keypoints, confidences, hands_data, frame):
+    def stage3_visualize_and_evaluate(self, movement, keypoints, confidences, hands_data, frame,
+                                       pstate: 'PersonState' = None, person_rank: int = 0):
         """
-        Stage 3: Visualisasi skeleton 100% presisi (Support COCO 17 Keypoints, Roboflow 13 Keypoints & MediaPipe 21 Finger Keypoints).
+        Stage 3: Visualisasi skeleton presisi + evaluasi biomekanik per orang.
+        pstate: PersonState orang ini. person_rank: 0/1/2 menentukan warna & posisi HUD.
         """
         status = "POSISIKAN TUBUH TERLIHAT PENUH"
-        color = (0, 255, 255)
+        color  = (0, 255, 255)
+
+        # Warna identitas orang ini
+        p_color = _PERSON_COLORS[min(person_rank, len(_PERSON_COLORS) - 1)]
         
         if len(keypoints) == 17:
             # COCO 17 Keypoints:
@@ -386,34 +449,31 @@ class BiomechanicalPipeline:
             ]
             
             # Garis penghubung ke titik rotasi atas
-            cv2.line(frame, (mid_x, by_min), (mid_x, top_handle_y), (0, 255, 255), 1, cv2.LINE_AA)
-            
+            cv2.line(frame, (mid_x, by_min), (mid_x, top_handle_y), p_color, 1, cv2.LINE_AA)
+
             for hx, hy in handles:
-                cv2.circle(frame, (hx, hy), 5, (0, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(frame, (hx, hy), 5, p_color, -1, cv2.LINE_AA)
                 cv2.circle(frame, (hx, hy), 6, (0, 0, 0), 1, cv2.LINE_AA)
 
-            # Label Text "SKELETON 1 (MANUAL)" di pojok atas kanan bounding box
-            label_text = "SKELETON 1 (MANUAL)"
-            cv2.putText(frame, label_text, (bx_max - 175, by_min + 20), cv2.FONT_HERSHEY_DUPLEX, 0.42, (0, 0, 0), 2, cv2.LINE_AA)
-            cv2.putText(frame, label_text, (bx_max - 176, by_min + 19), cv2.FONT_HERSHEY_DUPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+            # Label SKELETON dengan nomor orang
+            label_text = f"SKELETON {person_rank + 1}"
+            cv2.putText(frame, label_text, (bx_max - 145, by_min + 20), cv2.FONT_HERSHEY_DUPLEX, 0.42, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, label_text, (bx_max - 146, by_min + 19), cv2.FONT_HERSHEY_DUPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # 2. Gambar Garis Skeleton Tebal Warna Kuning Cerah (Single Color Yellow Limbs)
-        limb_color = (0, 230, 255)
+        # 2. Gambar Garis Skeleton dengan warna identitas orang
+        limb_color = p_color
         for p1, p2 in skeleton_limbs:
             if is_valid_pt(p1) and is_valid_pt(p2):
                 pt1 = (int(keypoints[p1][0]), int(keypoints[p1][1]))
                 pt2 = (int(keypoints[p2][0]), int(keypoints[p2][1]))
                 cv2.line(frame, pt1, pt2, limb_color, 3, cv2.LINE_AA)
 
-        # 3. Gambar Titik Sendi Lingkaran Kuning Solid & Angka Indeks Sendi (1..17)
+        # 3. Gambar Titik Sendi dengan warna identitas orang
         for i in range(len(keypoints)):
             if is_valid_pt(i):
                 x, y = int(keypoints[i][0]), int(keypoints[i][1])
-                # Lingkaran sendi kuning solid
-                cv2.circle(frame, (x, y), 6, (0, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(frame, (x, y), 6, p_color, -1, cv2.LINE_AA)
                 cv2.circle(frame, (x, y), 7, (0, 0, 0), 1, cv2.LINE_AA)
-                
-                # Angka 1-indexed (1, 2, 3, ... 17) dengan shadow hitam untuk kontras tinggi
                 kpt_num_str = str(i + 1)
                 cv2.putText(frame, kpt_num_str, (x + 8, y + 5), cv2.FONT_HERSHEY_DUPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
                 cv2.putText(frame, kpt_num_str, (x + 7, y + 4), cv2.FONT_HERSHEY_DUPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
@@ -441,11 +501,13 @@ class BiomechanicalPipeline:
 
         # 4. Perhitungan Sudut Biomekanik & Rep Counter (Push-up/Plank)
         if len(keypoints) == 13:
-            kpt_sh, kpt_hip, kpt_ank, kpt_kne = 1, 7, 11, 9
-            kpt_elb, kpt_wri = 3, 4
+            kpt_sh,   kpt_hip, kpt_ank, kpt_kne = 1, 7, 11, 9
+            kpt_elb,  kpt_wri = 3, 4
+            kpt_sh_r, kpt_elb_r, kpt_wri_r = 2, 3, 4  # Fallback simetris untuk 13-kpt
         else:
-            kpt_sh, kpt_hip, kpt_ank, kpt_kne = 5, 11, 15, 13
-            kpt_elb, kpt_wri = 7, 9
+            kpt_sh,   kpt_hip, kpt_ank, kpt_kne = 5, 11, 15, 13
+            kpt_elb,  kpt_wri = 7, 9
+            kpt_sh_r, kpt_elb_r, kpt_wri_r = 6, 8, 10  # Siku/wrist kanan (COCO 17-kpt)
 
         # Pilih acuan kaki: Ankle jika terdeteksi (conf >= 0.55), atau Knee jika ankle di luar kamera
         ref_leg_kpt = kpt_ank if confidences[kpt_ank] >= 0.55 else (kpt_kne if confidences[kpt_kne] >= 0.55 else None)
@@ -474,49 +536,144 @@ class BiomechanicalPipeline:
             cv2.putText(frame, f"{int(hip_angle_val)}deg", (hip_pt[0] + 12, hip_pt[1] - 10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
 
+        # ── Sudut Siku Kiri ──────────────────────────────────────────────────────
+        elbow_samples = []  # Kumpulkan sudut dari sisi yang terdeteksi untuk dirata-ratakan
+
         if (confidences[kpt_sh] >= 0.55 and 
             confidences[kpt_elb] >= 0.55 and 
             confidences[kpt_wri] >= 0.55 and
             math.dist(keypoints[kpt_sh], keypoints[kpt_elb]) > 25):
-            
-            # Hitung Sudut Siku (Fase Gerakan Push-up)
-            elbow_angle_val = self.calculate_angle(keypoints[kpt_sh], keypoints[kpt_elb], keypoints[kpt_wri])
-            
-            # Logika Repetition Counter State Machine
-            if elbow_angle_val < 90 and self.stage == "UP":
-                self.stage = "DOWN"
-            if elbow_angle_val > 155 and self.stage == "DOWN":
-                self.stage = "UP"
-                self.rep_count += 1
 
-            # Draw Angle Arc & Text Overlay di Siku
+            angle_left = self.calculate_angle(keypoints[kpt_sh], keypoints[kpt_elb], keypoints[kpt_wri])
+            elbow_samples.append(angle_left)
+
+            # Draw Angle Arc & Text Overlay di Siku Kiri
             self.draw_angle_arc(frame, keypoints[kpt_sh], keypoints[kpt_elb], keypoints[kpt_wri], color=(255, 0, 255), radius=28)
             elb_pt = (int(keypoints[kpt_elb][0]), int(keypoints[kpt_elb][1]))
-            cv2.putText(frame, f"{int(elbow_angle_val)}deg", (elb_pt[0] + 12, elb_pt[1] - 10), 
+            cv2.putText(frame, f"{int(angle_left)}deg", (elb_pt[0] + 12, elb_pt[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2, cv2.LINE_AA)
 
-        # 5. Modern Glassmorphic HUD Card Dashboard (Di Pojok Atas Kanan)
-        hud_w, hud_h = 360, 210
-        hud_x = max(10, w - hud_w - 15)
-        hud_y = 15
+        # ── Sudut Siku Kanan ─────────────────────────────────────────────────────
+        if (kpt_elb_r < len(keypoints) and
+            confidences[kpt_sh_r] >= 0.55 and
+            confidences[kpt_elb_r] >= 0.55 and
+            confidences[kpt_wri_r] >= 0.55 and
+            math.dist(keypoints[kpt_sh_r], keypoints[kpt_elb_r]) > 25):
+
+            angle_right = self.calculate_angle(keypoints[kpt_sh_r], keypoints[kpt_elb_r], keypoints[kpt_wri_r])
+            elbow_samples.append(angle_right)
+
+            # Draw Angle Arc & Text Overlay di Siku Kanan
+            self.draw_angle_arc(frame, keypoints[kpt_sh_r], keypoints[kpt_elb_r], keypoints[kpt_wri_r], color=(200, 0, 255), radius=28)
+            elb_r_pt = (int(keypoints[kpt_elb_r][0]), int(keypoints[kpt_elb_r][1]))
+            cv2.putText(frame, f"{int(angle_right)}deg", (elb_r_pt[0] + 12, elb_r_pt[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 0, 255), 2, cv2.LINE_AA)
+
+        # ── Rata-rata sudut siku & State Machine ─────────────────────────────────
+        if elbow_samples:
+            elbow_angle_val = sum(elbow_samples) / len(elbow_samples)
+
+            # Logika Repetition Counter State Machine (per-person via pstate)
+            if pstate is not None:
+                if elbow_angle_val < 90 and pstate.stage == "UP":
+                    pstate.stage = "DOWN"
+                if elbow_angle_val > 155 and pstate.stage == "DOWN":
+                    pstate.stage = "UP"
+                    pstate.rep_count += 1
+            else:
+                # Fallback jika dipanggil tanpa pstate (single-person legacy)
+                pass
+
+        # ── Hitung Depth Percentage dari rata-rata sudut siku ────────────────────
+        if elbow_angle_val > 0 and pstate is not None:
+            raw_depth = (elbow_angle_val - self.PUSHUP_ANGLE_DOWN) / (
+                         self.PUSHUP_ANGLE_UP - self.PUSHUP_ANGLE_DOWN) * 100.0
+            raw_depth = max(0.0, min(100.0, raw_depth))
+            pstate._depth_buffer.append(raw_depth)
+            if len(pstate._depth_buffer) > 5:
+                pstate._depth_buffer.pop(0)
+            pstate.depth_pct = sum(pstate._depth_buffer) / len(pstate._depth_buffer)
+
+        # 5. HUD Card per orang (diperkecil 30%, ditumpuk vertikal)
+        #    Ukuran asli 360x210 → 252x147
+        hud_w, hud_h = 252, 147
+        hud_x = max(10, w - hud_w - 12)
+        hud_y = 12 + person_rank * (hud_h + 5)   # Ditumpuk vertikal per orang
+
+        cur_stage  = pstate.stage      if pstate else "UP"
+        cur_reps   = pstate.rep_count  if pstate else 0
+        cur_depth  = pstate.depth_pct  if pstate else 100.0
 
         overlay = frame.copy()
         cv2.rectangle(overlay, (hud_x, hud_y), (hud_x + hud_w, hud_y + hud_h), (15, 15, 20), -1)
         cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
-        cv2.rectangle(frame, (hud_x, hud_y), (hud_x + hud_w, hud_y + hud_h), (0, 230, 255), 2) # Border Cyan
+        cv2.rectangle(frame, (hud_x, hud_y), (hud_x + hud_w, hud_y + hud_h), p_color, 2)  # Border warna identitas
 
-        # Formulasi Text Status Finger Tracking untuk HUD
-        hands_str = " | ".join(hand_summary) if hand_summary else "Palm Tracker Active"
+        hands_str = " | ".join(hand_summary) if hand_summary else "Palm Active"
 
-        # HUD Text Content
-        cv2.putText(frame, "BIOMECHANICAL ANALYSIS", (hud_x + 15, hud_y + 28), cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 230, 255), 2, cv2.LINE_AA)
-        cv2.putText(frame, f"REPS : {self.rep_count}", (hud_x + 15, hud_y + 62), cv2.FONT_HERSHEY_DUPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA)
-        cv2.putText(frame, f"STAGE: {self.stage}", (hud_x + 190, hud_y + 62), cv2.FONT_HERSHEY_DUPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(frame, f"GERAKAN : {movement}", (hud_x + 15, hud_y + 92), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
-        cv2.putText(frame, f"STATUS  : {status}", (hud_x + 15, hud_y + 120), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
-        cv2.putText(frame, f"SUDUT   : Hip {int(hip_angle_val)}deg | Elbow {int(elbow_angle_val)}deg", (hud_x + 15, hud_y + 146), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(frame, f"HANDS   : {hands_str}", (hud_x + 15, hud_y + 172), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(frame, f"FPS     : {self.fps:.1f}", (hud_x + 15, hud_y + 194), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 0), 1, cv2.LINE_AA)
+        # HUD Text (font dikecilkan 30%)
+        cv2.putText(frame, f"P{person_rank+1} BIOMECHANICAL",
+            (hud_x + 8, hud_y + 18), cv2.FONT_HERSHEY_DUPLEX, 0.42, p_color, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"REPS:{cur_reps}",
+            (hud_x + 8, hud_y + 42), cv2.FONT_HERSHEY_DUPLEX, 0.62, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(frame, f"{cur_stage}",
+            (hud_x + 130, hud_y + 42), cv2.FONT_HERSHEY_DUPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, f"MOV : {movement}",
+            (hud_x + 8, hud_y + 63), cv2.FONT_HERSHEY_SIMPLEX, 0.37, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"STAT: {status[:26]}",
+            (hud_x + 8, hud_y + 81), cv2.FONT_HERSHEY_SIMPLEX, 0.36, color, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"ELBOW:{int(elbow_angle_val)}d HIP:{int(hip_angle_val)}d",
+            (hud_x + 8, hud_y + 99), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"HAND: {hands_str[:22]}",
+            (hud_x + 8, hud_y + 116), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (0, 230, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"FPS : {self.fps:.1f}",
+            (hud_x + 8, hud_y + 133), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (0, 255, 0), 1, cv2.LINE_AA)
+
+        # 6. Depth Bar (per orang, side-by-side di pojok kanan bawah)
+        #    Person 0: paling kanan, Person 1: geser kiri 40px, Person 2: geser lagi
+        bar_w     = 22
+        bar_h     = 160
+        bar_x     = w - 40 - person_rank * 40   # Jarak 40px antar bar
+        bar_y_top = h - bar_h - 50
+
+        # Background glassmorphic
+        bg_pad = 8
+        ov2 = frame.copy()
+        cv2.rectangle(ov2,
+            (bar_x - bg_pad, bar_y_top - 28),
+            (bar_x + bar_w + bg_pad, bar_y_top + bar_h + 38),
+            (15, 15, 20), -1)
+        cv2.addWeighted(ov2, 0.70, frame, 0.30, 0, frame)
+
+        # Track (area kosong)
+        cv2.rectangle(frame, (bar_x, bar_y_top), (bar_x + bar_w, bar_y_top + bar_h), (55, 55, 55), -1)
+        cv2.rectangle(frame, (bar_x, bar_y_top), (bar_x + bar_w, bar_y_top + bar_h), p_color, 2)
+
+        # Warna fill bar berdasarkan depth
+        if cur_depth < 30:
+            bar_color = (30, 30, 220)
+        elif cur_depth < 65:
+            bar_color = (0, 185, 255)
+        else:
+            bar_color = (30, 220, 80)
+
+        # Fill dari bawah ke atas
+        fill_h = int(bar_h * cur_depth / 100.0)
+        fill_y = bar_y_top + bar_h - fill_h
+        if fill_h > 0:
+            cv2.rectangle(frame, (bar_x, fill_y), (bar_x + bar_w, bar_y_top + bar_h), bar_color, -1)
+
+        # Label stage atas
+        cv2.putText(frame, "UP" if cur_stage == "UP" else "DN",
+            (bar_x + 1, bar_y_top - 8), cv2.FONT_HERSHEY_DUPLEX, 0.38, p_color, 1, cv2.LINE_AA)
+
+        # Label P# di atas stage
+        cv2.putText(frame, f"P{person_rank+1}",
+            (bar_x + 3, bar_y_top - 20), cv2.FONT_HERSHEY_DUPLEX, 0.35, p_color, 1, cv2.LINE_AA)
+
+        # Label % bawah
+        cv2.putText(frame, f"{int(cur_depth)}%",
+            (bar_x - 3, bar_y_top + bar_h + 25), cv2.FONT_HERSHEY_DUPLEX, 0.55, bar_color, 2, cv2.LINE_AA)
 
         return frame
 
@@ -530,31 +687,41 @@ class BiomechanicalPipeline:
             self._fps_buffer.pop(0)
         self.fps = sum(self._fps_buffer) / len(self._fps_buffer)
 
-        # Cek jika frame kamera hitam — sampling region kecil (jauh lebih cepat dari frame.mean())
+        # Cek jika frame kamera hitam — sampling region kecil
         if frame is None or frame[230:250, 400:440].mean() < 1.0:
             cv2.putText(frame, "KAMERA HITAM / TERKUNCI!", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             cv2.putText(frame, "Buka Privacy Shutter / Tekan Fn+F6 / Cek Lenovo Vantage", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             cv2.putText(frame, f"FPS: {self.fps:.1f}", (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             return frame
 
-        # Tahap 1: Ekstraksi Keypoint Body & Temporal Smoothing
-        keypoints, confidences = self.stage1_extract_and_smooth(frame)
+        # Tahap 1: Deteksi & tracking semua orang (maks. 3)
+        persons_list = self.stage1_extract_and_smooth(frame)
 
-        # Tahap 1.5: Ekstraksi 21 Keypoint Jari & Gesture Tangan (Dual Engine MediaPipe / YOLO Wrist ROI)
-        hands_data = self.stage1_5_extract_and_smooth_hands(frame, keypoints, confidences)
-
-        if keypoints is None: 
+        if not persons_list:
             cv2.putText(frame, "Mencari Pose / Orang...", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
             cv2.putText(frame, f"FPS: {self.fps:.1f}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             return frame
-        
-        # Tahap 2: Klasifikasi Gerakan
-        movement = self.stage2_classify_movement(keypoints)
-        
-        # Tahap 3: Visualisasi Biomekanik & Evaluasi (100% Stabil)
-        annotated_frame = self.stage3_visualize_and_evaluate(movement, keypoints, confidences, hands_data, frame)
-        
-        return annotated_frame
+
+        # Tahap 2-3: Proses setiap orang secara berurutan
+        for person in persons_list:
+            tid   = person['track_id']
+            rank  = person['rank']
+            kpts  = person['keypoints']
+            conf  = person['confidences']
+            pstate = self.persons[tid]
+
+            # 1.5: Ekstraksi Palm Center dari hand_tracker milik orang ini
+            hands_data = pstate.hand_tracker.extract_hands(frame, kpts, conf)
+
+            # 2: Klasifikasi gerakan
+            movement = self.stage2_classify_movement(kpts)
+
+            # 3: Visualisasi & evaluasi (per orang)
+            frame = self.stage3_visualize_and_evaluate(
+                movement, kpts, conf, hands_data, frame, pstate, rank
+            )
+
+        return frame
 
 
 if __name__ == "__main__":
